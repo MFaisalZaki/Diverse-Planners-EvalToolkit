@@ -1,0 +1,9 @@
+{
+    "planner-tag": "BP-ASP",
+    "adapter": "bp-asp",
+    "planner-params": {
+        "indicator": "B-Coverage",
+        "max-horizon": 1000
+    },
+    "tracks": ["classical"]
+}

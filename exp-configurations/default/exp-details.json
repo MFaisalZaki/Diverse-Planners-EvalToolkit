@@ -1,0 +1,36 @@
+{
+    "name": "default",
+    "cfgs": {
+        "timelimit": "00:30:00",
+        "memorylimit": "8GB",
+        "slurm-time-headroom": "00:10:00",
+        "slurm-memory-headroom": "2GB",
+        "validate-plans": true,
+        "slurm": {
+            "cpus-per-task": 1,
+            "partition": null,
+            "qos": null,
+            "account": null,
+            "max-parallel-jobs": 100,
+            "max-array-size": 1000,
+            "extra-directives": []
+        }
+    },
+    "diversity": {
+        "k-values": [5, 10, 100, 1000],
+        "quality-bounds": [1.0, 1.1, 1.2, 2.0],
+        "models": {
+            "go": [["go", {}]],
+            "go-ru": [["go", {}], ["ru", {"resources": "builtin", "optional": true}]]
+        }
+    },
+    "tasks": {
+        "tracks": ["classical"],
+        "max-instances-per-domain": 0,
+        "selection": "even",
+        "include-domains": [],
+        "exclude-domains": [],
+        "ipc-years": [],
+        "selected-tasks": []
+    }
+}

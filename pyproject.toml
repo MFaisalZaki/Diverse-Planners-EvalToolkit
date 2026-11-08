@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diverse-planners-eval-toolkit"
+version = "0.1.0"
+description = "Benchmark harness for diverse planners: coverage, timeouts and behaviour-diversity indicators on slurm."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Mustafa Faisal Zaki", email = "mustafa.faisal.eng@gmail.com"}]
+requires-python = ">=3.10"
+# The harness itself needs unified-planning and nothing else. The planners are
+# extras: a venv carries the ones you benchmark. generate/analyze/report are
+# stdlib-only, so a sweep can be generated and analysed on a laptop.
+dependencies = ["unified-planning>=1.1.0"]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.6"]
+fi = ["forbiditerative"]
+bp-smt = ["behaviour-planning-smt @ git+https://github.com/MFaisalZaki/pyBehaviourPlanningSMT.git"]
+bp-asp = ["behaviour-planning-asp @ git+https://github.com/MFaisalZaki/pyBehaviourPlanningASP.git"]
+all = [
+    "matplotlib>=3.6",
+    "forbiditerative",
+    "behaviour-planning-smt @ git+https://github.com/MFaisalZaki/pyBehaviourPlanningSMT.git",
+    "behaviour-planning-asp @ git+https://github.com/MFaisalZaki/pyBehaviourPlanningASP.git",
+]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+dpevalcli = "dp_eval_toolkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dp_eval_toolkit*"]
+
+[tool.setuptools.package-data]
+"dp_eval_toolkit" = ["data/ru-info/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

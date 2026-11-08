@@ -1,0 +1,6 @@
+{
+    "planner-tag": "BP-SMT",
+    "adapter": "bp-smt",
+    "planner-params": {},
+    "tracks": ["classical"]
+}

@@ -1,0 +1,35 @@
+{
+    "name": "demo",
+    "cfgs": {
+        "timelimit": "00:05:00",
+        "memorylimit": "4GB",
+        "slurm-time-headroom": "00:05:00",
+        "slurm-memory-headroom": "1GB",
+        "validate-plans": true,
+        "slurm": {
+            "cpus-per-task": 1,
+            "partition": null,
+            "qos": null,
+            "account": null,
+            "max-parallel-jobs": 50,
+            "max-array-size": 1000,
+            "extra-directives": []
+        }
+    },
+    "diversity": {
+        "k-values": [5, 10],
+        "quality-bounds": [1.0, 1.2],
+        "models": {
+            "go-ru": [["go", {}], ["ru", {"resources": "builtin", "optional": true}]]
+        }
+    },
+    "tasks": {
+        "tracks": ["classical"],
+        "max-instances-per-domain": 3,
+        "selection": "first",
+        "include-domains": ["rovers*", "logistics*", "depot*"],
+        "exclude-domains": [],
+        "ipc-years": [],
+        "selected-tasks": []
+    }
+}

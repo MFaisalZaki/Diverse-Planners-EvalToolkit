@@ -1,0 +1,9 @@
+{
+    "planner-tag": "FI",
+    "adapter": "fi",
+    "planner-params": {
+        "planner": "extended_unordered_topq",
+        "symmetries": true
+    },
+    "tracks": ["classical"]
+}
