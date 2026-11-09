@@ -16,7 +16,8 @@ toolkit's behaviour evaluator like everyone else's.
                        ``B-MaxMin`` or ``B-Novelty`` (default: none, keep the first k)
 ``pool-size``          how many plans to ask FI for: a count, or a multiple of k such
                        as ``"3x"`` (default: k, as in the paper -- then ``select`` only
-                       matters when FI returns more plans than asked)
+                       matters when FI returns more plans than asked); both as in
+                       :class:`~.base.DiversePlannerAdapter`
 ``planner``            FI planner configuration (default ``extended_unordered_topq``)
 ``symmetries``         pass ``--symmetries`` (default true)
 ``extra-args``         list of further command-line arguments, verbatim
@@ -87,29 +88,17 @@ class ForbidIterativeAdapter(DiversePlannerAdapter):
         fi_seconds = time.monotonic() - started
         if budget is not None and fi_seconds >= budget - 1:
             timed_out = True
-        plans = self._select(ctx, pool, logs)
-        info = {'fi-seconds': fi_seconds, 'fi-exit-code': exit_code, 'pool-plans': len(pool),
-                'pool-asked': self._pool_size(ctx.k), 'selection': self.params.get('select'),
+        plans = self.select(ctx, pool, logs)
+        info = {'fi-seconds': fi_seconds, 'fi-exit-code': exit_code, **self.selection_info(pool, ctx.k),
                 'selection-seconds': time.monotonic() - started - fi_seconds}
         outcome = self.outcome_for(len(pool), ctx.k, timed_out)
         return DiverseRun(plans=plans, outcome=outcome, logs=logs, info=info)
-
-    def _select(self, ctx: PlanningContext, pool: list[Any], logs: list[str]) -> list[Any]:
-        """The k plans to report: the most diverse under the task's model when
-        ``select`` names an indicator, the first k otherwise."""
-        indicator = self.params.get('select')
-        if not indicator or len(pool) <= ctx.k:
-            return pool[:ctx.k]
-        from ..behaviours import select_plans
-
-        logs.append(f'selected {ctx.k} of {len(pool)} plans by {indicator}')
-        return select_plans(ctx.problem, pool, ctx.features, ctx.k, str(indicator))
 
     def _command(self, ctx: PlanningContext, budget: float | None) -> list[str]:
         cmd = [str(self.params.get('python') or sys.executable), '-c', _LAUNCHER,
                '--planner', str(self.params.get('planner', 'extended_unordered_topq')),
                '--domain', ctx.domain_file, '--problem', ctx.problem_file,
-               '--number-of-plans', str(self._pool_size(ctx.k)), '--quality-bound', str(ctx.q)]
+               '--number-of-plans', str(self.pool_size(ctx.k)), '--quality-bound', str(ctx.q)]
         if self.params.get('symmetries', True):
             cmd.append('--symmetries')
         cmd += ['--use-local-folder', '--clean-local-folder', '--suppress-planners-output']
@@ -117,15 +106,6 @@ class ForbidIterativeAdapter(DiversePlannerAdapter):
             cmd += ['--overall-time-limit', str(int(budget))]
         cmd += [str(a) for a in self.params.get('extra-args', [])]
         return cmd
-
-    def _pool_size(self, k: int) -> int:
-        """Plans to ask FI for: ``pool-size`` as a count or a ``"<n>x"`` multiple of k, never below k."""
-        raw = self.params.get('pool-size')
-        if raw is None:
-            return k
-        text = str(raw).strip().lower()
-        pool = round(float(text[:-1]) * k) if text.endswith('x') else int(text)
-        return max(k, pool)
 
     def _environment(self) -> dict[str, str]:
         env = os.environ.copy()

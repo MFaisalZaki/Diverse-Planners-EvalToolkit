@@ -137,7 +137,7 @@ def select_plans(problem, plans: Sequence[Any], specs: Sequence[tuple[str, Any]]
     ``B-MaxSum``, ``B-MaxMin`` or ``B-Novelty``) under the diversity model `specs`.
 
     This is the post-hoc selection a planner that knows nothing about behaviours
-    (FI) gets: generate a pool, keep the `k` most diverse. With `k` or fewer
+    (FI, the naive ASP baseline) gets: generate a pool, keep the `k` most diverse. With `k` or fewer
     plans there is nothing to choose and the pool comes back as it is.
     """
     if indicator not in INDICATORS:

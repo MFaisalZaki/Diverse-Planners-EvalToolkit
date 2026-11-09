@@ -26,7 +26,7 @@ Planners benchmarked out of the box:
 |---|---|---|
 | `fi` | Forbid-Iterative top-quality planner (`extended_unordered_topq`), the baseline of the behaviour-planning paper experiments; with `"select"` it keeps the `k` most diverse of the plans it finds (B-Coverage or B-MaxSum, via BehaviourDiversityCounter) | [`forbiditerative`](https://pypi.org/project/forbiditerative/) |
 | `bp-smt` | Behaviour planning over SMT (`ForbiddenBehaviorSMTPlanner`) | [pyBehaviourPlanningSMT](https://github.com/MFaisalZaki/pyBehaviourPlanningSMT) |
-| `bp-asp` | Behaviour planning over ASP (`BCoveragePlanner` / `BMaxSumPlanner`) | [pyBehaviourPlanningASP](https://github.com/MFaisalZaki/pyBehaviourPlanningASP) |
+| `bp-asp` | Behaviour planning over ASP (`BCoveragePlanner` / `BMaxSumPlanner`); with `"naive": true` a naive baseline over an empty behaviour space (the library's top-k version) that returns the first distinct plans within the bound, and `"select"` picks the `k` most diverse of them like FI | [pyBehaviourPlanningASP](https://github.com/MFaisalZaki/pyBehaviourPlanningASP) |
 | `up-anytime` | any Unified Planning engine with the `AnytimePlanner` interface (first `k` distinct plans) | — |
 | `package.module:Class` | your own adapter (see [Adding a planner](#adding-a-planner)) | — |
 
@@ -94,7 +94,9 @@ experiment/
     ├── fi-bcoverage.json           FI, k plans picked from its pool by B-Coverage
     ├── fi-bmaxsum.json             FI, picked by B-MaxSum
     ├── bp-asp-bcoverage.json       ASP behaviour planner optimising B-Coverage
-    └── bp-asp-bmaxsum.json         ... optimising B-MaxSum
+    ├── bp-asp-bmaxsum.json         ... optimising B-MaxSum
+    ├── bp-asp-naive-bcoverage.json naive ASP baseline (no diversity model), k plans picked by B-Coverage
+    └── bp-asp-naive-bmaxsum.json   ... picked by B-MaxSum
 ```
 
 ```jsonc
@@ -152,7 +154,7 @@ then `opt` over `sat`, then the alphabetically first directory. The default
 configuration uses the builtin list; `demo` does not.
 
 Every (model, k, q) combination is crossed with every instance and every
-planner: 4 k × 4 q × 2 models × N instances × 3 planners commands.
+planner: 4 k × 4 q × 2 models × N instances × 6 planners commands.
 
 ```jsonc
 // planners/bp-asp.json
@@ -221,7 +223,14 @@ instance is left out of that model's runs and listed under `not-applicable` in
   budget as its timeout.
 * **BP-ASP** gets the model as feature specs and `q` as its `quality_bound`. It
   gets the remaining budget as its own timeout, so on a timeout it returns the
-  plans it holds.
+  plans it holds. With `"naive": true` it is the **naive baseline**, the
+  library's top-k version: the same ASP encoding and cost bound over an empty
+  behaviour space, so every plan has the one empty behaviour and the planner
+  returns the first distinct plans within the bound. `"select"` and
+  `"pool-size"` work as for FI, which is how the two shipped naive versions
+  pick their `k` plans by B-Coverage and by B-MaxSum; without `"pool-size"`
+  the pool is `k` plans and the two coincide. Either way the set is scored by
+  the evaluator under the task's model, like every other planner's.
 
 ## What a run records
 

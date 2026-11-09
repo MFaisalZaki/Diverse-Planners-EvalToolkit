@@ -1,0 +1,12 @@
+{
+    "planner-tag": "BP-ASP-Naive-BCoverage",
+    "adapter": "bp-asp",
+    "planner-params": {
+        "naive": true,
+        "select": "B-Coverage",
+        "max-horizon": 1000
+    },
+    "tracks": [
+        "classical"
+    ]
+}

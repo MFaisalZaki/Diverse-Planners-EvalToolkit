@@ -90,6 +90,40 @@ class DiversePlannerAdapter:
     def plan(self, ctx: PlanningContext) -> DiverseRun:
         raise NotImplementedError
 
+    # -- post-hoc selection, for planners that know nothing about behaviours --
+    #
+    # ``planner-params``: ``select`` names an indicator (``B-Coverage``,
+    # ``B-MaxSum``, ``B-MaxMin`` or ``B-Novelty``) to pick the k most diverse plans
+    # of the planner's pool under the task's model, with BehaviourDiversityCounter;
+    # ``pool-size`` is how many plans to ask the planner for, a count or a multiple
+    # of k such as ``"3x"`` (default k, so ``select`` then only matters when the
+    # planner returns more plans than asked).
+
+    def pool_size(self, k: int) -> int:
+        """Plans to ask the planner for: ``pool-size`` as a count or a ``"<n>x"``
+        multiple of k, never below k."""
+        raw = self.params.get('pool-size')
+        if raw is None:
+            return k
+        text = str(raw).strip().lower()
+        pool = round(float(text[:-1]) * k) if text.endswith('x') else int(text)
+        return max(k, pool)
+
+    def select(self, ctx: PlanningContext, pool: Sequence[Any], logs: list[str]) -> list[Any]:
+        """The k plans to report: the most diverse under the task's model when
+        ``select`` names an indicator, the first k otherwise."""
+        indicator = self.params.get('select')
+        if not indicator or len(pool) <= ctx.k:
+            return list(pool[:ctx.k])
+        from ..behaviours import select_plans
+
+        logs.append(f'selected {ctx.k} of {len(pool)} plans by {indicator}')
+        return select_plans(ctx.problem, pool, ctx.features, ctx.k, str(indicator))
+
+    def selection_info(self, pool: Sequence[Any], k: int) -> dict[str, Any]:
+        """What the result records about the pool and the selection."""
+        return {'pool-plans': len(pool), 'pool-asked': self.pool_size(k), 'selection': self.params.get('select')}
+
     @staticmethod
     def outcome_for(count: int, k: int, timed_out: bool = False) -> str:
         """The outcome of a run that returned `count` plans: ``COMPLETE`` with

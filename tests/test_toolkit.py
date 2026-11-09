@@ -373,3 +373,42 @@ def test_behaviour_evaluator(tmp_path):
     broken = reader.parse_plan_string(problem, '(unload p1 t1 dest)')
     scores = evaluate_plan_set(problem, [*plans, broken], [('go', {})])
     assert len(scores['errors']) == 1 and scores['evaluated-plans'] == 4
+
+
+def test_bp_asp_naive_ignores_the_model():
+    from dp_eval_toolkit.adapters import load_adapter
+    from dp_eval_toolkit.adapters.base import PlanningContext
+
+    ctx = PlanningContext(problem=None, domain_file='', problem_file='', k=2, q=1.0,
+                          features=[('go', {}), ('cb', {})], deadline=None, workdir='')
+    assert load_adapter('bp-asp', {'indicator': 'B-Coverage'}).unsupported_reason(ctx) == \
+        "bp-asp does not support feature(s) ['cb']"
+    assert load_adapter('bp-asp', {'naive': True}).unsupported_reason(ctx) is None
+
+
+def test_bp_asp_naive_solve(tmp_path):
+    pytest.importorskip('behaviour_planning_asp')
+    from dp_eval_toolkit.cli import main
+
+    bench = _bench(tmp_path)
+    planner_cfg = tmp_path / 'naive.json'
+    planner_cfg.write_text(json.dumps({'planner-tag': 'NAIVE', 'adapter': 'bp-asp',
+                                       'planner-params': {'naive': True, 'select': 'B-MaxSum', 'pool-size': '2x'}}))
+    results_dir = tmp_path / 'results'
+    assert main(['solve', '--planner-cfg', str(planner_cfg),
+                 '--domain', str(bench / 'delivery' / 'domain.pddl'), '--problem', str(bench / 'delivery' / 'p01.pddl'),
+                 '--task-id', 'mini:delivery:p01', '--k', '5', '--q', '1.2', '--model', 'go-ru',
+                 '--feature', 'go', '--feature', f'ru={tmp_path / "res" / "delivery" / "resources.txt"}',
+                 '--results-dir', str(results_dir), '--errors-dir', str(tmp_path / 'errors'),
+                 '--run-dir', str(tmp_path / 'runs'), '--time-limit', '120', '--memory-limit', '0']) == 0
+    result = json.loads((results_dir / 'mini_delivery_p01.json').read_text())
+    assert result['status'] == 'SOLVED' and result['adapter-outcome'] == 'COMPLETE'
+    assert result['metrics']['plan-count'] == 5 and result['metrics']['valid-plans'] == 5
+    assert len({tuple(p) for p in result['plans']}) == 5, 'the naive planner returns distinct plans'
+    # An empty behaviour space: the planner sees one (empty) behaviour; the evaluator scores the set.
+    assert result['info'] == {'indicator': 'B-Coverage', 'naive': True, 'optimal-length': 5, 'cost-bound': 6,
+                              'native-b-coverage': 1, 'pool-plans': 10, 'pool-asked': 10, 'selection': 'B-MaxSum'}
+    assert 'selected 5 of 10 plans by B-MaxSum' in result['logs']
+    assert result['native-behaviours'] == ['<>'] * 5
+    assert 1 <= result['diversity-scores']['b-coverage'] <= 5
+    assert all(cost <= 6 for cost in result['diversity-scores']['costs'])
