@@ -7,19 +7,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 import types
 
 import pytest
+import synthetic
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from dp_eval_toolkit import analyzer, generator, resources  # noqa: E402
-from dp_eval_toolkit.config import Experiment, FeatureSpec, parse_memory, parse_time, run_label  # noqa: E402
-from dp_eval_toolkit.runner import parse_feature  # noqa: E402
-from dp_eval_toolkit.tasks import Task  # noqa: E402
-
-import synthetic  # noqa: E402
+from dp_eval_toolkit import analyzer, generator, resources
+from dp_eval_toolkit.config import Experiment, FeatureSpec, parse_memory, parse_time, read_instance_refs, run_label
+from dp_eval_toolkit.runner import parse_feature
+from dp_eval_toolkit.discovery import classify_domain, discover
+from dp_eval_toolkit.tasks import Task, parse_instance_ref, select_instances
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -106,6 +103,61 @@ def test_bad_quality_bound(tmp_path):
         Experiment.load(str(exp))
 
 
+def _api_domain(root, directory, name, ipc, problems):
+    """A classical-domains style domain directory: api.py + the files it names."""
+    dom = root / directory
+    dom.mkdir(parents=True)
+    (dom / 'domain.pddl').write_text(DOMAIN)
+    for problem in problems:
+        (dom / problem).write_text(PROBLEM)
+    pairs = [(f'{directory}/domain.pddl', f'{directory}/{problem}') for problem in problems]
+    (dom / 'api.py').write_text(f'domains = [{{"name": {name!r}, "ipc": {ipc!r}, "problems": {pairs!r}}}]\n')
+
+
+def test_select_instances(tmp_path):
+    root = tmp_path / 'classical'
+    # Two IPC-2008 tracks of one domain, an ADL encoding, and a domain without a year.
+    _api_domain(root, 'openstacks-opt08-strips', 'openstacks', '2008', ['p01.pddl', 'p02.pddl', 'p10.pddl'])
+    _api_domain(root, 'openstacks-sat08-strips', 'openstacks', '2008', ['p01.pddl', 'p02.pddl', 'p10.pddl'])
+    _api_domain(root, 'openstacks-opt08-adl', 'openstacks', '2008', ['p01.pddl', 'p02.pddl', 'p10.pddl'])
+    _api_domain(root, 'miconic', 'miconic', None, ['s1-0.pddl', 's10-0.pddl', 's2-0.pddl'])
+    tasks = discover(str(root), suite='cd')
+    assert len(tasks) == 12
+    # Numbering follows the api.py problems sorted by path: p01 < p02 < p10, s1-0 < s10-0 < s2-0.
+    by_id = {t.task_id: t for t in tasks}
+    assert by_id['cd:miconic:s10-0'].api_index == 2 and by_id['cd:miconic:s2-0'].api_index == 3
+
+    chosen = select_instances(tasks, ['(2008, openstacks, 3)', '(None, miconic, 2)', '(2008, openstacks, 99)'])
+    assert [(t.domain, t.instance) for t in chosen] == [('miconic', 's10-0'), ('openstacks-opt08-strips', 'p10')]
+    assert parse_instance_ref([2008, 'openstacks', '3']) == ('2008', 'openstacks', 3)
+    with pytest.raises(ValueError):
+        parse_instance_ref('(2008, openstacks)')
+
+    # The shipped list of the paper experiments, and a file with comments.
+    builtin = read_instance_refs('builtin')
+    assert len(builtin) == 1076 and '(2006, rovers, 14)' in builtin
+    listing = tmp_path / 'some.txt'
+    listing.write_text('# header\n(2008, openstacks, 3)  # trailing\n\n(None, miconic, 1)\n')
+    assert read_instance_refs(str(listing)) == ['(2008, openstacks, 3)', '(None, miconic, 1)']
+    assert read_instance_refs([[2008, 'openstacks', 3]]) == ['(2008, openstacks, 3)']
+
+
+def test_classify_domain(tmp_path):
+    def track(text):
+        path = tmp_path / 'domain.pddl'
+        path.write_text(text)
+        return classify_domain(str(path))
+
+    assert track(DOMAIN) == 'classical'
+    costs = DOMAIN.replace('(:predicates', '(:functions (total-cost) - number)\n  (:predicates')
+    assert track(costs) == 'classical'
+    fuel = DOMAIN.replace('(:predicates', '(:functions (total-cost) (fuel ?t - truck))\n  (:predicates')
+    assert track(fuel) == 'numeric'
+    assert track(DOMAIN.replace(':typing', ':typing :numeric-fluents')) == 'numeric'
+    assert track(DOMAIN.replace('(:action drive', ';; (:durative-action old\n  (:action drive')) == 'classical'
+    assert track(DOMAIN.replace('(:action drive', '(:durative-action drive')) == 'temporal'
+
+
 def test_shipped_configurations_load():
     for name in os.listdir(os.path.join(ROOT, 'exp-configurations')):
         experiment = Experiment.load(os.path.join(ROOT, 'exp-configurations', name))
@@ -115,7 +167,8 @@ def test_shipped_configurations_load():
 def test_builtin_resources(tmp_path):
     task = Task('classical-domains', 'rovers', 'p07', '/d.pddl', '/p07.pddl', 'classical', '2006')
     path = resources.resolve_feature('ru', 'builtin', task, str(tmp_path), str(tmp_path))
-    text = open(path).read()
+    with open(path) as handle:
+        text = handle.read()
     assert text.count(':resource') == 3 and 'rover2' in text
     # no year: two rovers files exist, so the instance is ambiguous
     task = Task('s', 'rovers', 'p07', '/d.pddl', '/p07.pddl', 'classical', None)
@@ -154,7 +207,8 @@ def test_generate(tmp_path):
     results_dir = first.split('--results-dir ')[1].split()[0]
     os.makedirs(results_dir, exist_ok=True)
     slug = first.split('--task-id ')[1].split()[0].replace(':', '_')
-    open(os.path.join(results_dir, f'{slug}.json'), 'w').write('{}')
+    with open(os.path.join(results_dir, f'{slug}.json'), 'w') as handle:
+        handle.write('{}')
     args.skip_existing = True
     assert generator.generate(args) == 0
     assert len((sandbox / 'cmds' / 'A.txt').read_text().splitlines()) == 15
@@ -230,7 +284,49 @@ def test_report_figures(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# Behaviour evaluator (needs unified-planning)
+# Runner and behaviour evaluator (need unified-planning)
+
+PLANS = [
+    # p1 first, one truck
+    '(load p1 t1 src)\n(drive t1 src dest)\n(unload p1 t1 dest)\n(drive t1 dest src)\n'
+    '(load p2 t1 src)\n(drive t1 src dest)\n(unload p2 t1 dest)',
+    # p2 first, one truck
+    '(load p2 t1 src)\n(drive t1 src dest)\n(unload p2 t1 dest)\n(drive t1 dest src)\n'
+    '(load p1 t1 src)\n(drive t1 src dest)\n(unload p1 t1 dest)',
+    # both at once, two trucks
+    '(load p1 t1 src)\n(load p2 t2 src)\n(drive t1 src dest)\n(drive t2 src dest)\n'
+    '(unload p1 t1 dest)\n(unload p2 t2 dest)',
+    # p1 first again, the other truck
+    '(load p1 t2 src)\n(drive t2 src dest)\n(unload p1 t2 dest)\n(drive t2 dest src)\n'
+    '(load p2 t2 src)\n(drive t2 src dest)\n(unload p2 t2 dest)',
+]
+
+
+def test_solve_with_custom_adapter(tmp_path):
+    pytest.importorskip('unified_planning')
+    from dp_eval_toolkit.cli import main
+
+    bench = _bench(tmp_path)
+    planner_cfg = tmp_path / 'fake.json'
+    planner_cfg.write_text(json.dumps({'planner-tag': 'FAKE', 'adapter': 'fake_adapter:FakeAdapter',
+                                       'planner-params': {'plans': PLANS[:3]}}))
+    results_dir = tmp_path / 'results'
+    assert main(['solve', '--planner-cfg', str(planner_cfg),
+                 '--domain', str(bench / 'delivery' / 'domain.pddl'), '--problem', str(bench / 'delivery' / 'p01.pddl'),
+                 '--task-id', 'mini:delivery:p01', '--k', '5', '--q', '1.2', '--model', 'go-ru',
+                 '--feature', 'go', '--feature', f'ru={tmp_path / "res" / "delivery" / "resources.txt"}',
+                 '--results-dir', str(results_dir), '--errors-dir', str(tmp_path / 'errors'),
+                 '--run-dir', str(tmp_path / 'runs'), '--time-limit', '0', '--memory-limit', '0']) == 0
+    result = json.loads((results_dir / 'mini_delivery_p01.json').read_text())
+    assert result['status'] == 'EXHAUSTED' and result['adapter-outcome'] == 'EXHAUSTED'
+    assert result['metrics']['plan-count'] == 3 and result['metrics']['validated'] is True
+    assert result['metrics']['valid-plans'] == 3 and result['metrics']['invalid-plans'] == 0
+    assert result['diversity-scores']['b-coverage'] == 3
+    assert result['diversity-scores']['costs'] == [7, 7, 6]
+    assert result['info'] == {'optimal-length': 6} and result['native-behaviours'] == ['fake'] * 3
+    assert len(result['plans']) == 3 and result['plans'][2][0].startswith('(load p1 t1 src)')
+    assert not list(results_dir.glob('*.running')) and not list((tmp_path / 'runs').glob('FAKE__*'))
+    assert result['timings']['planning-seconds'] >= 0 and 'evaluation-seconds' in result['timings']
 
 def test_behaviour_evaluator(tmp_path):
     pytest.importorskip('unified_planning')
@@ -240,27 +336,40 @@ def test_behaviour_evaluator(tmp_path):
     bench = _bench(tmp_path)
     reader = PDDLReader()
     problem = reader.parse_problem(str(bench / 'delivery' / 'domain.pddl'), str(bench / 'delivery' / 'p01.pddl'))
-    plans_text = [
-        # p1 first, one truck
-        '(load p1 t1 src)\n(drive t1 src dest)\n(unload p1 t1 dest)\n(drive t1 dest src)\n'
-        '(load p2 t1 src)\n(drive t1 src dest)\n(unload p2 t1 dest)',
-        # p2 first, one truck
-        '(load p2 t1 src)\n(drive t1 src dest)\n(unload p2 t1 dest)\n(drive t1 dest src)\n'
-        '(load p1 t1 src)\n(drive t1 src dest)\n(unload p1 t1 dest)',
-        # both at once, two trucks
-        '(load p1 t1 src)\n(load p2 t2 src)\n(drive t1 src dest)\n(drive t2 src dest)\n'
-        '(unload p1 t1 dest)\n(unload p2 t2 dest)',
-        # same behaviour as the first
-        '(load p1 t2 src)\n(drive t2 src dest)\n(unload p1 t2 dest)\n(drive t2 dest src)\n'
-        '(load p2 t2 src)\n(drive t2 src dest)\n(unload p2 t2 dest)',
-    ]
-    plans = [reader.parse_plan_string(problem, text) for text in plans_text]
-    scores = evaluate_plan_set(problem, plans, [('go', {}), ('ru', str(tmp_path / 'res' / 'delivery' / 'resources.txt'))])
-    assert scores['errors'] == []
+    plans = [reader.parse_plan_string(problem, text) for text in PLANS]
+    resources_file = str(tmp_path / 'res' / 'delivery' / 'resources.txt')
+
+    # Behaviours (goal order, number of trucks used -- the planners' `ru`, the
+    # counter's `rc`): A = p1 then p2 with one truck, B = p2 then p1 with one truck,
+    # C = p1 then p2 with both trucks; D repeats A with the other truck. psi_M is the
+    # mean of go (Hamming / 2 goals) and ru (|a - b| / (a + b)):
+    # A-B = (1 + 0)/2, A-C = (0 + 1/3)/2, B-C = (1 + 1/3)/2.
+    scores = evaluate_plan_set(problem, plans, [('go', {}), ('ru', resources_file)])
+    assert scores['errors'] == [] and scores['notes'] == []
     assert scores['b-coverage'] == 3
-    # Behaviours (goal ranks, resources used): A = p1 then p2 with one truck, B = p2 then
-    # p1 with one truck, C = p1 then p2 with two trucks; the fourth plan repeats A.
-    # psi_M = mean of the two features: A-B = (1 + 0) / 2, A-C = (0 + 1) / 2, B-C = (1 + 1) / 2.
-    assert scores['b-maxsum'] == pytest.approx(2.0)
+    assert scores['b-maxsum'] == pytest.approx(4 / 3)
     assert scores['distinct-plans'] == 4
     assert scores['costs'] == [7, 7, 6, 7]
+    assert all(b.startswith('go:') and ' $$ rc:' in b for b in scores['behaviours'])
+
+    # Naming the trucks instead of counting them tells D apart from A: four
+    # behaviours, A-B = (1 + 0)/2, A-C = (0 + 1/2)/2, A-D = (0 + 1)/2, B-C = (1 + 1/2)/2,
+    # B-D = (1 + 1)/2, C-D = (0 + 1/2)/2 (Jaccard over the used sets).
+    scores = evaluate_plan_set(problem, plans, [('go', {}), ('ru-set', resources_file)])
+    assert scores['b-coverage'] == 4
+    assert scores['b-maxsum'] == pytest.approx(3.25)
+    assert scores['b-maxmin'] == pytest.approx(0.25)
+
+    # Post-hoc selection, as the FI configurations use it: two plans by B-Coverage
+    # cover two distinct behaviours; a pool of k or fewer comes back untouched.
+    from dp_eval_toolkit.behaviours import select_plans
+    picked = select_plans(problem, plans, [('go', {}), ('ru', resources_file)], 2, 'B-Coverage')
+    assert len(picked) == 2 and len({p.behaviour for p in picked}) == 2
+    assert select_plans(problem, plans, [('go', {})], 4, 'B-MaxSum') == plans
+    with pytest.raises(ValueError):
+        select_plans(problem, plans, [('go', {})], 2, 'B-Mean')
+
+    # A plan that cannot be replayed is reported, not counted.
+    broken = reader.parse_plan_string(problem, '(unload p1 t1 dest)')
+    scores = evaluate_plan_set(problem, [*plans, broken], [('go', {})])
+    assert len(scores['errors']) == 1 and scores['evaluated-plans'] == 4

@@ -18,10 +18,10 @@ those are recorded.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
-from .base import (COMPLETE, EXHAUSTED, TIMEOUT, UNSOLVABLE, UNSUPPORTED, DiversePlannerAdapter,
-                   DiverseRun, PlanningContext)
+from .base import (COMPLETE, EXHAUSTED, TIMEOUT, UNSOLVABLE, UNSUPPORTED, DiversePlannerAdapter, DiverseRun,
+                   PlanningContext)
 
 
 class BehaviourPlanningASPAdapter(DiversePlannerAdapter):
@@ -45,22 +45,17 @@ class BehaviourPlanningASPAdapter(DiversePlannerAdapter):
 
         planner = PLANNERS[indicator](space)
         timeout = ctx.remaining(margin=float(self.params.get('time-margin', 10)))
-        result = planner.plan(ctx.k, timeout=timeout,
-                              max_horizon=int(self.params.get('max-horizon', 1000)))
-        outcome = {
-            asp_base.COMPLETE: COMPLETE,
-            asp_base.EXHAUSTED: EXHAUSTED,
-            asp_base.UNSOLVABLE: UNSOLVABLE,
-            asp_base.TIMED_OUT: TIMEOUT,
-        }.get(result.status, result.status.upper())
-        info: Dict[str, Any] = {
+        result = planner.plan(ctx.k, timeout=timeout, max_horizon=int(self.params.get('max-horizon', 1000)))
+        outcomes = {asp_base.COMPLETE: COMPLETE, asp_base.EXHAUSTED: EXHAUSTED,
+                    asp_base.UNSOLVABLE: UNSOLVABLE, asp_base.TIMED_OUT: TIMEOUT}
+        info: dict[str, Any] = {
             'indicator': indicator,
             'optimal-length': result.optimal_length,
             'cost-bound': result.horizon,
             'native-b-coverage': result.b_coverage,
             'native-b-maxsum': float(result.b_maxsum(space.model)),
         }
-        plans: List[Any] = [p.plan for p in result.plans]
-        native = [space.model.describe(p.behaviour) for p in result.plans]
-        return DiverseRun(plans=plans, outcome=outcome, logs=list(result.logs), info=info,
-                          native_behaviours=native)
+        return DiverseRun(plans=[p.plan for p in result.plans],
+                          outcome=outcomes.get(result.status, result.status.upper()),
+                          logs=list(result.logs), info=info,
+                          native_behaviours=[space.model.describe(p.behaviour) for p in result.plans])

@@ -38,7 +38,7 @@ CONFIG=""                      # name under exp-configurations/, or a path
 DEFAULT_CONFIG="default"
 TIME_LIMIT=""                  # default: the configuration's own
 MEMORY_LIMIT=""
-MAX_INSTANCES="0"
+MAX_INSTANCES=""                # default: the configuration's own (0 = all)
 TRACKS="classical"
 K_VALUES=""
 Q_VALUES=""
@@ -50,9 +50,15 @@ EXTRAS=""
 PACKAGES=""
 SKIP_FETCH="no"
 SKIP_INSTALL="no"
+SEPARATE_VENVS="no"            # one virtualenv per planner, even when one would do
 LIST_CONFIGS="no"
 ASSUME_YES="no"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+# The interpreter the venv is built with. unified-planning and the
+# behaviour-diversity counter support Python 3.10 to 3.13; left blank, the
+# newest supported one on PATH is used.
+PYTHON_BIN="${PYTHON_BIN:-}"
+PYTHON_MIN="3.10"
+PYTHON_MAX_EXCLUSIVE="3.14"
 
 CLASSICAL_REPO="https://github.com/AI-Planning/classical-domains.git"
 NUMERIC_REPO="https://github.com/pyPMT/numeric-domains.git"
@@ -61,6 +67,39 @@ NUMERIC_REPO="https://github.com/pyPMT/numeric-domains.git"
 # equivalent of classical-domains/numeric-domains for the temporal track.
 TEMPORAL_REPO="https://github.com/potassco/pddl-instances.git"
 CLI_NAME="dpevalcli"
+
+# "3.12" for an interpreter, or nothing when it cannot be run.
+python_version() {
+    "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true
+}
+
+# Is a "major.minor" version within [PYTHON_MIN, PYTHON_MAX_EXCLUSIVE)?
+python_supported() {
+    [ -n "$1" ] || return 1
+    printf '%s\n%s\n%s\n' "$PYTHON_MIN" "$1" "$PYTHON_MAX_EXCLUSIVE" | sort -V -c 2>/dev/null \
+        && [ "$1" != "$PYTHON_MAX_EXCLUSIVE" ]
+}
+
+# Choose the interpreter for the venv: the one given with --python/PYTHON_BIN,
+# checked, or else the newest supported python3.X on PATH.
+pick_python() {
+    if [ -n "$PYTHON_BIN" ]; then
+        command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "python interpreter not found: ${PYTHON_BIN}"
+        local version
+        version="$(python_version "$PYTHON_BIN")"
+        python_supported "$version" || die "${PYTHON_BIN} is Python ${version:-?}; the toolkit's dependencies need ${PYTHON_MIN} <= Python < ${PYTHON_MAX_EXCLUSIVE} (try --python python3.13)"
+        return
+    fi
+    local candidate
+    for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if python_supported "$(python_version "$candidate")"; then
+            PYTHON_BIN="$candidate"
+            return
+        fi
+    done
+    die "no Python ${PYTHON_MIN}-3.13 interpreter on PATH (python3 is $(python_version python3)); install one and pass --python python3.13"
+}
 
 usage() {
     cat <<'EOF'
@@ -84,7 +123,7 @@ Options:
                           (default: <work-dir>/experiments/<config>)
   --time-limit VALUE      per task, e.g. 00:30:00 or 30m
   --memory-limit VALUE    per task, e.g. 8GB
-  --max-instances N       instances per domain, 0 for all
+  --max-instances N       instances per domain, 0 for all (default: the configuration's own)
   --tracks "a b c"        subset of: classical numeric temporal (default: classical)
   --k-values "5 10 100"   numbers of plans (default: the configuration's)
   --quality-bounds "1.0 1.2"  quality bounds q >= 1.0 (default: the configuration's)
@@ -102,6 +141,12 @@ Options:
                           (e.g. "~/dev/pyBehaviourPlanningASP")
   --skip-fetch            do not clone/update the benchmark repositories
   --skip-install          do not create the venv or install anything
+  --separate-venvs        install every planner into its own virtualenv
+                          (<work-dir>/venv-<planner>) and point its configuration
+                          at it; done automatically when the planners' dependency
+                          pins cannot be satisfied in one environment
+  --python BIN            interpreter for the venv (default: the newest python3.10-3.13
+                          on PATH; python3.14+ is not supported by the dependencies)
   -y, --yes               accept every default, never prompt
   -h, --help              this message
 EOF
@@ -132,6 +177,8 @@ while [ $# -gt 0 ]; do
         --packages)         PACKAGES="$2"; shift 2 ;;
         --skip-fetch)       SKIP_FETCH="yes"; shift ;;
         --skip-install)     SKIP_INSTALL="yes"; shift ;;
+        --separate-venvs)   SEPARATE_VENVS="yes"; shift ;;
+        --python)           PYTHON_BIN="$2"; shift 2 ;;
         -y|--yes)           ASSUME_YES="yes"; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -285,13 +332,18 @@ TASKS_DIR="${TASKS_DIR:-${WORK_DIR}/benchmark-tasks}"
 SANDBOX_DIR="${SANDBOX_DIR:-${WORK_DIR}/sandbox/${CONFIG_NAME}}"
 EXP_DIR="${EXP_DIR:-${WORK_DIR}/experiments/${CONFIG_NAME}}"
 
-# Limits default to the chosen configuration's own values.
+# The interpreter is needed from here on: to read the configuration, to work
+# out which planners to install and to build the venv.
+pick_python
+
+# Limits default to the chosen configuration's own values: cfg_value SECTION KEY FALLBACK.
 cfg_value() {
-    "$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cfgs",{}).get(sys.argv[2]) or sys.argv[3])' \
-        "${TEMPLATE_DIR}/exp-details.json" "$1" "$2"
+    "$PYTHON_BIN" -c 'import json,sys; v = json.load(open(sys.argv[1])).get(sys.argv[2], {}).get(sys.argv[3]); print(sys.argv[4] if v is None else v)' \
+        "${TEMPLATE_DIR}/exp-details.json" "$1" "$2" "$3"
 }
-TIME_LIMIT="${TIME_LIMIT:-$(cfg_value timelimit 00:30:00)}"
-MEMORY_LIMIT="${MEMORY_LIMIT:-$(cfg_value memorylimit 8GB)}"
+TIME_LIMIT="${TIME_LIMIT:-$(cfg_value cfgs timelimit 00:30:00)}"
+MEMORY_LIMIT="${MEMORY_LIMIT:-$(cfg_value cfgs memorylimit 8GB)}"
+MAX_INSTANCES="${MAX_INSTANCES:-$(cfg_value tasks max-instances-per-domain 0)}"
 ask "Per-task time limit (HH:MM:SS or 30m)"      "$TIME_LIMIT"    TIME_LIMIT
 ask "Per-task memory limit (e.g. 8GB)"           "$MEMORY_LIMIT"  MEMORY_LIMIT
 ask "Tracks to benchmark"                        "$TRACKS"        TRACKS
@@ -340,6 +392,7 @@ say "config       ${CONFIG_NAME} (${TEMPLATE_DIR})"
 say "             $(config_summary "$TEMPLATE_DIR")"
 say "work dir     ${WORK_DIR}"
 say "venv         ${VENV_DIR}"
+say "python       ${PYTHON_BIN} ($(python_version "$PYTHON_BIN"))"
 say "tasks        ${TASKS_DIR}"
 say "sandbox      ${SANDBOX_DIR}"
 say "experiment   ${EXP_DIR}"
@@ -352,7 +405,6 @@ say "slurm        partition=${PARTITION:-default} qos=${QOS:-default} account=${
 echo
 
 mkdir -p "$WORK_DIR" "$TASKS_DIR"
-command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "python interpreter not found: ${PYTHON_BIN}"
 
 # ------------------------------------------------------------- experiment --
 # Set up before installing: the planner configurations decide which planners have
@@ -431,32 +483,140 @@ PY
 IMPLIED_EXTRAS="$(cat "$EXTRAS_FILE")"
 ALL_EXTRAS="$(printf '%s,%s' "$IMPLIED_EXTRAS" "$EXTRAS" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -)"
 
+# Create a virtualenv with the chosen interpreter, or check that an existing one
+# was built with a supported Python.
+# Returns non-zero (after a warning) when the venv cannot be made usable.
+ensure_venv() {
+    local venv="$1" version
+    if [ ! -d "$venv" ]; then
+        say "creating virtualenv at ${venv} with ${PYTHON_BIN} ($(python_version "$PYTHON_BIN"))"
+        "$PYTHON_BIN" -m venv "$venv" || { warn "could not create a virtualenv at ${venv}"; return 1; }
+    else
+        version="$(python_version "${venv}/bin/python")"
+        if ! python_supported "$version"; then
+            warn "${venv} was built with Python ${version:-?}, which the dependencies do not support; remove it (rm -rf ${venv}) for a fresh one"
+            return 1
+        fi
+        say "reusing virtualenv at ${venv} (Python ${version})"
+    fi
+    # Only pip: builds run in isolated environments, and a planner may pin its
+    # own setuptools (pyBehaviourPlanningSMT does).
+    "${venv}/bin/python" -m pip install --quiet --upgrade pip || warn "could not upgrade pip in ${venv}; carrying on with the one it has"
+    return 0
+}
+
+# Packages that could not be installed: "what|why", reported again at the end.
+INSTALL_FAILURES=()
+note_install_failure() {
+    INSTALL_FAILURES+=("$1|$2")
+    warn "$1: $2"
+}
+
+# pip install the toolkit (with the given extras) into a virtualenv; pip's output
+# goes to a log that is named only when the install fails.
+install_toolkit() {
+    local venv="$1" extras="$2" log target
+    target="${REPO_DIR}"
+    [ -n "$extras" ] && target="${REPO_DIR}[${extras}]"
+    log="$(mktemp "${TMPDIR:-/tmp}/dpeval-pip.XXXXXX")"
+    if "${venv}/bin/python" -m pip install --quiet -e "$target" > "$log" 2>&1; then
+        rm -f "$log"
+        return 0
+    fi
+    PIP_LOG="$log"
+    return 1
+}
+
+# The pyproject extra and the module that proves the planner is installed.
+planner_probe() {
+    case "$1" in
+        fi)     echo forbiditerative ;;
+        bp-smt) echo behaviour_planning_smt.fbi.planner ;;
+        bp-asp) echo behaviour_planning_asp ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Give every planner configuration of the experiment that uses adapter $1 (and
+# names no environment of its own) the virtualenv $2.
+assign_planner_venv() {
+    "$PYTHON_BIN" - "${EXP_DIR}/planners" "$1" "$2" <<'PY'
+import json, os, sys
+directory, adapter, venv = sys.argv[1:4]
+for name in sorted(os.listdir(directory)):
+    if not name.endswith('.json'):
+        continue
+    path = os.path.join(directory, name)
+    with open(path) as handle:
+        cfg = json.load(handle)
+    if cfg.get('adapter') != adapter or any(cfg.get(k) for k in ('venv-dir', 'conda-env', 'apptainer-image')):
+        continue
+    cfg['venv-dir'] = venv
+    with open(path, 'w') as handle:
+        json.dump(cfg, handle, indent=4)
+        handle.write('\n')
+    print(f'  {name}: venv-dir = {venv}')
+PY
+}
+
+# One virtualenv per planner: the toolkit alone in the main venv, each planner's
+# extra in <work-dir>/venv-<planner>, and the planner configurations pointed there.
+# A planner that cannot be installed is reported, not fatal: the rest of the
+# sweep is still set up, and the summary at the end says what is missing.
+install_separately() {
+    local base_extras planner_extras extra planner_venv probe
+    base_extras="$(printf '%s,%s' "plots" "$EXTRAS" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -)"
+    say "installing the toolkit into ${VENV_DIR} (extras: ${base_extras})"
+    install_toolkit "$VENV_DIR" "$base_extras" || die "could not install the toolkit; pip's output is in ${PIP_LOG}"
+    planner_extras="$(printf '%s' "$IMPLIED_EXTRAS" | tr ',' '\n' | grep -v '^plots$' || true)"
+    for extra in $planner_extras; do
+        planner_venv="${WORK_DIR}/venv-${extra}"
+        if ! ensure_venv "$planner_venv"; then
+            note_install_failure "planner ${extra}" "no usable virtualenv at ${planner_venv}"
+            continue
+        fi
+        say "installing planner ${extra} into ${planner_venv}"
+        if ! install_toolkit "$planner_venv" "$extra"; then
+            note_install_failure "planner ${extra}" "pip could not install it into ${planner_venv}; pip's output is in ${PIP_LOG}"
+            continue
+        fi
+        probe="$(planner_probe "$extra")"
+        if [ -n "$probe" ] && ! "${planner_venv}/bin/python" -c "import ${probe}" 2>/dev/null; then
+            note_install_failure "planner ${extra}" "installed into ${planner_venv} but 'import ${probe}' fails there"
+        fi
+        assign_planner_venv "$extra" "$planner_venv"
+    done
+}
+
 if [ "$SKIP_INSTALL" = "yes" ]; then
     say "skipping installation (--skip-install)"
     [ ${#PACKAGE_ARGS[@]} -gt 0 ] && warn "--skip-install also skips the extra packages: ${PACKAGE_ARGS[*]}"
     [ -x "${VENV_DIR}/bin/${CLI_NAME}" ] || warn "no ${CLI_NAME} in ${VENV_DIR}; generation will fail"
 else
-    if [ ! -d "$VENV_DIR" ]; then
-        say "creating virtualenv at ${VENV_DIR}"
-        "$PYTHON_BIN" -m venv "$VENV_DIR"
+    ensure_venv "$VENV_DIR" || die "no usable virtualenv at ${VENV_DIR} (pass --venv-dir for another location)"
+    if [ "$SEPARATE_VENVS" = "yes" ]; then
+        install_separately
     else
-        say "reusing virtualenv at ${VENV_DIR}"
-    fi
-    # shellcheck disable=SC1091
-    . "${VENV_DIR}/bin/activate"
-    python -m pip install --quiet --upgrade pip setuptools wheel
-    if [ -n "$ALL_EXTRAS" ]; then
-        say "installing the toolkit with extras: ${ALL_EXTRAS}"
-        python -m pip install --quiet -e "${REPO_DIR}[${ALL_EXTRAS}]"
-    else
-        say "installing the toolkit"
-        python -m pip install --quiet -e "${REPO_DIR}"
+        say "installing the toolkit with extras: ${ALL_EXTRAS:-none}"
+        if ! install_toolkit "$VENV_DIR" "$ALL_EXTRAS"; then
+            if grep -q 'ResolutionImpossible' "$PIP_LOG"; then
+                warn "the planners' dependency pins cannot all be satisfied in one environment (pip's output: ${PIP_LOG})"
+            else
+                warn "installing everything into one virtualenv failed (pip's output: ${PIP_LOG})"
+            fi
+            say "installing each planner into its own virtualenv instead, so one failure does not take the others down"
+            install_separately
+        fi
     fi
     if [ ${#PACKAGE_ARGS[@]} -gt 0 ]; then
         say "installing extra packages: ${PACKAGE_ARGS[*]}"
-        python -m pip install --quiet "${PACKAGE_ARGS[@]}"
+        PIP_LOG="$(mktemp "${TMPDIR:-/tmp}/dpeval-pip.XXXXXX")"
+        if "${VENV_DIR}/bin/python" -m pip install --quiet "${PACKAGE_ARGS[@]}" > "$PIP_LOG" 2>&1; then
+            rm -f "$PIP_LOG"
+        else
+            note_install_failure "extra packages (${PACKAGE_ARGS[*]})" "pip could not install them into ${VENV_DIR}; pip's output is in ${PIP_LOG}"
+        fi
     fi
-    deactivate
 fi
 
 CLI="${VENV_DIR}/bin/${CLI_NAME}"
@@ -464,9 +624,9 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 [ -x "$CLI" ] || die "${CLI_NAME} was not installed into ${VENV_DIR}"
 
 # Fail here rather than on ten thousand compute nodes each discovering the same
-# missing planner. (A planner with its own venv-dir is checked in that venv.)
+# missing planner. A planner with its own venv-dir is probed in that venv.
 say "checking that every configured planner is importable"
-"$CLI" check --exp-dir "$EXP_DIR" || warn "some planners cannot be imported in ${VENV_DIR} (fine if they set their own venv-dir)"
+"$CLI" check --exp-dir "$EXP_DIR" || warn "some planners are not importable from the environment their configuration names (see above)"
 
 # ------------------------------------------------------------- benchmarks --
 TASKS_ARGS=()
@@ -550,6 +710,17 @@ fi
 echo
 say "generating run commands"
 "$CLI" "${GENERATE_ARGS[@]}"
+
+if [ ${#INSTALL_FAILURES[@]} -gt 0 ]; then
+    echo
+    warn "${#INSTALL_FAILURES[@]} package(s) could not be installed; the sweep is generated without them working:"
+    for failure in "${INSTALL_FAILURES[@]}"; do
+        printf '   - %s\n       %s\n' "${failure%%|*}" "${failure#*|}" >&2
+    done
+    printf '   A planner that is not installed records every one of its tasks as ERROR. Either install it\n' >&2
+    printf '   by hand into the virtualenv named above (pip install -e "%s[<planner>]"), or delete its\n' "$REPO_DIR" >&2
+    printf '   file under %s/planners/ and re-run this script.\n' "$EXP_DIR" >&2
+fi
 
 cat <<EOF
 

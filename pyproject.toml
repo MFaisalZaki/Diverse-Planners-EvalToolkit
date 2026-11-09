@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,13 +7,19 @@ name = "diverse-planners-eval-toolkit"
 version = "0.1.0"
 description = "Benchmark harness for diverse planners: coverage, timeouts and behaviour-diversity indicators on slurm."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Mustafa Faisal Zaki", email = "mustafa.faisal.eng@gmail.com"}]
-requires-python = ">=3.10"
-# The harness itself needs unified-planning and nothing else. The planners are
-# extras: a venv carries the ones you benchmark. generate/analyze/report are
-# stdlib-only, so a sweep can be generated and analysed on a laptop.
-dependencies = ["unified-planning>=1.1.0"]
+# 3.14 is out: unified-planning's and behaviour-diversity-counter's dependencies
+# (scipy, numpy pins) have no 3.14 wheels and the counter declares < 3.14.
+requires-python = ">=3.10,<3.14"
+# The harness itself needs unified-planning and the behaviour-diversity counter
+# that scores every plan set. The planners are extras: a venv carries the ones
+# you benchmark. generate/analyze/report are stdlib-only, so a sweep can be
+# generated and analysed on a laptop.
+dependencies = [
+    "unified-planning>=1.1.0",
+    "behaviour-diversity-counter @ git+https://github.com/MFaisalZaki/BehaviourDiversityCounter.git",
+]
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.6"]
@@ -35,7 +41,19 @@ dpevalcli = "dp_eval_toolkit.cli:main"
 include = ["dp_eval_toolkit*"]
 
 [tool.setuptools.package-data]
-"dp_eval_toolkit" = ["data/ru-info/*.json"]
+"dp_eval_toolkit" = ["data/ru-info/*.json", "data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["benchmark-run"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "C4", "RUF", "PLW", "PLR0911", "PLR0915"]
+ignore = [
+    "B905",     # zip(strict=...) adds noise where the lengths are known to match
+    "RUF012",   # mutable class attributes are plain dicts/lists used as registries
+]

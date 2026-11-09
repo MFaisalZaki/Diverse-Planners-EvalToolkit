@@ -24,7 +24,7 @@ Planners benchmarked out of the box:
 
 | adapter | planner | source |
 |---|---|---|
-| `fi` | Forbid-Iterative top-quality planner (`extended_unordered_topq`), the baseline of the behaviour-planning paper experiments | [`forbiditerative`](https://pypi.org/project/forbiditerative/) |
+| `fi` | Forbid-Iterative top-quality planner (`extended_unordered_topq`), the baseline of the behaviour-planning paper experiments; with `"select"` it keeps the `k` most diverse of the plans it finds (B-Coverage or B-MaxSum, via BehaviourDiversityCounter) | [`forbiditerative`](https://pypi.org/project/forbiditerative/) |
 | `bp-smt` | Behaviour planning over SMT (`ForbiddenBehaviorSMTPlanner`) | [pyBehaviourPlanningSMT](https://github.com/MFaisalZaki/pyBehaviourPlanningSMT) |
 | `bp-asp` | Behaviour planning over ASP (`BCoveragePlanner` / `BMaxSumPlanner`) | [pyBehaviourPlanningASP](https://github.com/MFaisalZaki/pyBehaviourPlanningASP) |
 | `up-anytime` | any Unified Planning engine with the `AnytimePlanner` interface (first `k` distinct plans) | — |
@@ -36,13 +36,19 @@ Planners benchmarked out of the box:
 ./setup_benchmark.sh
 ```
 
-asks which configuration to run (`exp-configurations/default` or `demo`), where
+needs Python 3.10 to 3.13 (it picks the newest one on `PATH`; `--python
+python3.13` chooses explicitly, and 3.14 is refused because the dependencies
+do not support it yet). It asks which configuration to run (`exp-configurations/default` or `demo`), where
 everything should live, the per-task time and memory limit, the slurm
 partition, QOS and account, the numbers of plans `k` and the quality bounds
 `q`. It then creates a virtualenv, installs the toolkit with the planners the
 configuration names, clones
 [classical-domains](https://github.com/AI-Planning/classical-domains),
-generates the slurm job arrays and prints the `sbatch` command. Every prompt has
+generates the slurm job arrays and prints the `sbatch` command. When the
+planners' dependency pins cannot be satisfied in one environment (BP-SMT and
+BP-ASP currently disagree on `up-fast-downward`), each planner is installed
+into its own `venv-<planner>` and its configuration is pointed there;
+`--separate-venvs` does that from the start. Every prompt has
 a flag:
 
 ```bash
@@ -85,9 +91,10 @@ analysed on a laptop; only the compute nodes need the planners.
 experiment/
 ├── exp-details.json        limits, slurm, the diversity grid, task selection
 └── planners/
-    ├── fi.json
-    ├── bp-smt.json
-    └── bp-asp.json
+    ├── fi-bcoverage.json           FI, k plans picked from its pool by B-Coverage
+    ├── fi-bmaxsum.json             FI, picked by B-MaxSum
+    ├── bp-asp-bcoverage.json       ASP behaviour planner optimising B-Coverage
+    └── bp-asp-bmaxsum.json         ... optimising B-MaxSum
 ```
 
 ```jsonc
@@ -121,10 +128,28 @@ experiment/
         "tracks": ["classical"],
         "max-instances-per-domain": 0,      // 0 = all
         "selection": "even",
-        "include-domains": [], "exclude-domains": [], "ipc-years": [], "selected-tasks": []
+        "include-domains": [], "exclude-domains": [], "ipc-years": [], "selected-tasks": [],
+        "selected-instances": "builtin"     // the paper's instance list (below)
     }
 }
 ```
+
+`selected-instances` restricts a classical-domains style repository to a list
+of `(ipc-year, domain, n)` references in the convention of the
+behaviour-planning paper experiments
+([`classical_instances`](https://github.com/MFaisalZaki/pyBehaviourPlanningSMT/blob/paper-refactor/paper_experiments/apptainer-generate-benchmark-slurm-tasks.py)):
+`domain` and `ipc-year` are the `name` and `ipc` of a domain's `api.py`, and
+`n` is the 1-based position of the instance once that `api.py`'s problems are
+sorted by path. `"builtin"` is that very list (1076 instances, shipped as
+`dp_eval_toolkit/data/classical-instances.txt`); a file path (one reference
+per line, `#` comments) or an inline JSON list works too, as does
+`--selected-instances FILE|builtin` on `discover` and `generate`. Where
+classical-domains holds several directories for one (year, name) -- the `opt`
+and `sat` tracks of an IPC, `strips` beside `full` or `adl` encodings -- the
+paper's generator took whichever its directory walk met first; the toolkit
+fixes the choice: `adl` directories are skipped, then `strips` is preferred,
+then `opt` over `sat`, then the alphabetically first directory. The default
+configuration uses the builtin list; `demo` does not.
 
 Every (model, k, q) combination is crossed with every instance and every
 planner: 4 k × 4 q × 2 models × N instances × 3 planners commands.
@@ -148,20 +173,28 @@ and BP-SMT are often happier in separate environments.
 
 ### Diversity-model features
 
+Features are the dimensions of
+[BehaviourDiversityCounter](https://github.com/MFaisalZaki/BehaviourDiversityCounter),
+which scores every plan set (see below), named as the planners name them:
+
 | key | feature | config | dissimilarity |
 |---|---|---|---|
-| `go` | goal ordering: the rank at which each goal is first achieved | `{}` | fraction of goals whose rank differs |
-| `ru` | resource usage: how many of the listed resource objects the plan's actions use | resources (below) | \|a − b\| / (n − 1), capped at 1 |
-| `cb` | cost: the plan's length | `{}` | 0 if equal, 1 otherwise |
-| `fn` | numeric function values: the box each listed fluent ends in | functions file | fraction of fluents whose box differs |
+| `go` | goal ordering: the order in which the goal atoms are first achieved | `{}` (or `{"max-goals": m}`) | Hamming distance over the orderings / number of goals |
+| `cb` | cost: the sum of the plan's action costs (its length under unit cost) | `{}` | \|c − c'\| / max(c, c') |
+| `cbin` | cost bin: the bin of cost / optimal cost in a grid over [1, q] | `{"optimal-cost": c, "q": 1.2, "width": 0.1}` | bin distance / (bins − 1) |
+| `ru` | resource usage: how many of the listed resource objects the plan uses (the planners' and the paper's definition; the counter's `rc` dimension) | resources (below) | \|a − b\| / (a + b) |
+| `ru-set` | which of the listed resource objects the plan uses (the counter's `ru` dimension) | resources (below) | Jaccard distance over the used sets |
+| `fn` | numeric function values: the bin each listed fluent ends in | functions file | mean bin distance / (bins − 1) over the fluents |
+| `stability` | the plan's action set | `{}` | Jaccard distance over the action sets |
 
 `ru` needs a list of resource objects per instance. `"builtin"` uses the data
 shipped in `dp_eval_toolkit/data/ru-info` (from the behaviour-planning SMT paper
 experiments: rovers, logistics, depot, driverlog, barman, floortile, childsnack,
 assembly, agricola). A directory works too: either the same JSON files, or
 `<dir>/<domain>/<instance>.txt`, `<dir>/<domain>/resources.txt` or
-`<dir>/<domain>.txt` holding `(:resource NAME ...)` lines. `{"objects": [...]}`
-lists the names inline. `generate` resolves the data once per instance and
+`<dir>/<domain>.txt` holding `(:resource NAME MIN MAX DELTA)` lines. `{"objects": [...]}`
+lists the names inline. Names are matched to the task's objects case-insensitively,
+with `-` and `_` interchangeable; names that match no object are dropped and noted. `generate` resolves the data once per instance and
 writes it under `sandbox/feature-data/`. If an instance has no data,
 `"optional": true` drops the feature for that instance; without it, the
 instance is left out of that model's runs and listed under `not-applicable` in
@@ -170,7 +203,13 @@ instance is left out of that model's runs and listed under `not-applicable` in
 ### How each planner gets k, q and the model
 
 * **FI** takes `k` and `q` (`--number-of-plans`, `--quality-bound`) and ignores
-  the model. Its plans are scored like everyone else's (see below). It is
+  the model while searching. Its top-quality search usually leaves more than
+  `k` plans; with `"select": "B-Coverage"` (or `B-MaxSum`, `B-MaxMin`,
+  `B-Novelty`) the adapter keeps the `k` most diverse of them under the task's
+  model, as the paper's `fi-bc` baseline did; without it, the first `k`.
+  `"pool-size"` (a count, or `"3x"` for a multiple of `k`) asks FI for a larger
+  pool to choose from; the shipped configurations leave it at `k`, as in the
+  paper. The plans are then scored like everyone else's (see below). It is
   launched through a small shim that keeps its working files in a folder this
   run owns, so on a timeout the plans it has found are still recovered, and
   the folder is removed afterwards. `local-dir` (default `/tmp/planner_runs`)
@@ -208,25 +247,31 @@ and no plan failing validation. `--strict-k` on `analyze`/`report` counts
 
 ### Scoring diversity: one evaluator for every planner
 
-Every plan set is re-scored by `dp_eval_toolkit.behaviours`, which simulates
-each plan on the original problem and computes its behaviour under the task's
-diversity model. The planners' self-reported behaviours cannot serve as the
-yardstick: FI has none, and the two behaviour planners each compute theirs from
-their own encodings. Those self-reports are still kept in the result, and
-`analyze` reports how often a planner's own B-Coverage agrees with the
-evaluator's. On pyBehaviourPlanningASP the agreement is exact, since `go` and
-`ru` follow its definitions.
+Every plan set is re-scored by
+[BehaviourDiversityCounter](https://github.com/MFaisalZaki/BehaviourDiversityCounter)
+(through `dp_eval_toolkit.behaviours`), which replays each plan on the original
+problem and computes its behaviour under the task's diversity model. The
+planners' self-reported behaviours cannot serve as the yardstick: FI has none,
+and the two behaviour planners each compute theirs from their own encodings.
+Those self-reports are still kept in the result, and `analyze` reports how often
+a planner's own B-Coverage agrees with the evaluator's.
 
-Per plan set:
+Per plan set, each indicator over the *distinct* behaviours:
 
 * **B-Coverage**: the number of distinct behaviours;
 * **B-MaxSum**: the sum over pairs of distinct behaviours of the model's
   dissimilarity (the mean of the features' dissimilarities);
 * **B-MaxSum per pair**: B-MaxSum divided by the number of plan pairs, so it
   can be compared across `k`;
+* **B-MaxMin**: the smallest pairwise dissimilarity;
+* **B-Novelty**: the mean dissimilarity of each behaviour to its nearest
+  neighbours;
 * **stability** (mean pairwise Jaccard distance of action sets),
   **uniqueness** (fraction of plan pairs that are not reorderings of each
   other), distinct plans, plan costs.
+
+A plan that cannot be replayed on the problem is listed under the result's
+`errors` and left out of the indicators.
 
 ## Analysis
 
@@ -236,7 +281,7 @@ Per plan set:
 |---|---|
 | `coverage.csv` | per (model, k, q, planner) over **all** attempted instances: solved, coverage, `SOLVED` vs `EXHAUSTED`, timeouts, **timeouts that still returned plans** and the mean number of plans they returned, memouts, errors, unsupported, killed, missing, invalid plan sets, mean/median time of the solved ones |
 | `coverage-per-track.csv` | the same per track |
-| `diversity-common-solved.csv` | per (model, k, q, planner), over the instances **every** planner of the group solved: mean/median B-Coverage, B-Coverage / k, B-MaxSum, B-MaxSum per pair, stability, uniqueness, plan count, cost, and how often the planner alone had the best B-Coverage (and how often it tied) |
+| `diversity-common-solved.csv` | per (model, k, q, planner), over the instances **every** planner of the group solved: mean/median B-Coverage, B-Coverage / k, B-MaxSum, B-MaxSum per pair, B-MaxMin, B-Novelty, stability, uniqueness, plan count, cost, and how often the planner alone had the best B-Coverage (and how often it tied) |
 | `per-domain.csv` | coverage, timeouts and mean B-Coverage per domain |
 | `quality-bound-violations.csv` | solved plan sets whose costliest plan exceeds q × the cheapest plan any planner found for that instance |
 | `results.csv` | one row per diversity task |
@@ -309,6 +354,7 @@ the model features that make sense there (for example `fn`).
 ## Tests
 
 ```bash
+python3.13 -m venv venv && source venv/bin/activate    # Python 3.10-3.13
 pip install -e ".[dev,plots]"
 pytest
 ```

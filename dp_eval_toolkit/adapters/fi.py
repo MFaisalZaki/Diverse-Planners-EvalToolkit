@@ -3,11 +3,20 @@
 This is the baseline of the Behaviour Planning paper experiments
 (``paper_experiments/run-benchmark.py`` in pyBehaviourPlanningSMT): the
 ``forbiditerative`` package's top-quality planner, asked for ``k`` plans within
-quality bound ``q``. FI does not take a diversity model -- its plans are scored
-by the toolkit's behaviour evaluator like everyone else's.
+quality bound ``q``. FI does not take a diversity model: it is asked for ``k``
+plans and, as its top-quality search usually finds more than that within the
+bound, ``select`` picks the ``k`` most diverse of them under the task's model
+with BehaviourDiversityCounter -- the ``fi-bc`` baseline of the paper. Without
+``select`` the first ``k`` plans are kept. Either way the plans are scored by the
+toolkit's behaviour evaluator like everyone else's.
 
 ``planner-params``:
 
+``select``             pick k plans from FI's pool by ``B-Coverage``, ``B-MaxSum``,
+                       ``B-MaxMin`` or ``B-Novelty`` (default: none, keep the first k)
+``pool-size``          how many plans to ask FI for: a count, or a multiple of k such
+                       as ``"3x"`` (default: k, as in the paper -- then ``select`` only
+                       matters when FI returns more plans than asked)
 ``planner``            FI planner configuration (default ``extended_unordered_topq``)
 ``symmetries``         pass ``--symmetries`` (default true)
 ``extra-args``         list of further command-line arguments, verbatim
@@ -19,15 +28,16 @@ by the toolkit's behaviour evaluator like everyone else's.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import time
-from typing import Any, List
+from typing import Any
 
-from .base import COMPLETE, EXHAUSTED, TIMEOUT, UNSOLVABLE, DiversePlannerAdapter, DiverseRun, PlanningContext
+from .base import DiversePlannerAdapter, DiverseRun, PlanningContext
 
 # forbiditerative's --use-local-folder works in /tmp/planner_runs/<uuid> and only
 # copies the plans back to the cwd when it finishes cleanly: on a timeout the plans
@@ -56,6 +66,8 @@ sys.argv = ['forbiditerative.plan'] + sys.argv[1:]
 runpy.run_module('forbiditerative.plan', run_name='__main__', alter_sys=True)
 """
 
+_LOCAL_PATH_FILE = 'fi-local.path'
+
 
 class ForbidIterativeAdapter(DiversePlannerAdapter):
     name = 'fi'
@@ -64,103 +76,149 @@ class ForbidIterativeAdapter(DiversePlannerAdapter):
     def plan(self, ctx: PlanningContext) -> DiverseRun:
         margin = float(self.params.get('time-margin', 10))
         budget = ctx.remaining(margin)
+        cmd = self._command(ctx, budget)
+        logs = [' '.join(cmd)]
+        ctx.snapshot = lambda: _read_plans(ctx, logs=None)
+
+        started = time.monotonic()
+        exit_code, timed_out = _run(cmd, self._environment(), ctx.workdir, budget, margin, logs)
+        pool = _read_plans(ctx, logs)
+        _discard_local_folder(ctx)
+        fi_seconds = time.monotonic() - started
+        if budget is not None and fi_seconds >= budget - 1:
+            timed_out = True
+        plans = self._select(ctx, pool, logs)
+        info = {'fi-seconds': fi_seconds, 'fi-exit-code': exit_code, 'pool-plans': len(pool),
+                'pool-asked': self._pool_size(ctx.k), 'selection': self.params.get('select'),
+                'selection-seconds': time.monotonic() - started - fi_seconds}
+        outcome = self.outcome_for(len(pool), ctx.k, timed_out)
+        return DiverseRun(plans=plans, outcome=outcome, logs=logs, info=info)
+
+    def _select(self, ctx: PlanningContext, pool: list[Any], logs: list[str]) -> list[Any]:
+        """The k plans to report: the most diverse under the task's model when
+        ``select`` names an indicator, the first k otherwise."""
+        indicator = self.params.get('select')
+        if not indicator or len(pool) <= ctx.k:
+            return pool[:ctx.k]
+        from ..behaviours import select_plans
+
+        logs.append(f'selected {ctx.k} of {len(pool)} plans by {indicator}')
+        return select_plans(ctx.problem, pool, ctx.features, ctx.k, str(indicator))
+
+    def _command(self, ctx: PlanningContext, budget: float | None) -> list[str]:
         cmd = [str(self.params.get('python') or sys.executable), '-c', _LAUNCHER,
                '--planner', str(self.params.get('planner', 'extended_unordered_topq')),
                '--domain', ctx.domain_file, '--problem', ctx.problem_file,
-               '--number-of-plans', str(ctx.k), '--quality-bound', str(ctx.q)]
+               '--number-of-plans', str(self._pool_size(ctx.k)), '--quality-bound', str(ctx.q)]
         if self.params.get('symmetries', True):
             cmd.append('--symmetries')
         cmd += ['--use-local-folder', '--clean-local-folder', '--suppress-planners-output']
         if budget is not None:
             cmd += ['--overall-time-limit', str(int(budget))]
         cmd += [str(a) for a in self.params.get('extra-args', [])]
+        return cmd
 
+    def _pool_size(self, k: int) -> int:
+        """Plans to ask FI for: ``pool-size`` as a count or a ``"<n>x"`` multiple of k, never below k."""
+        raw = self.params.get('pool-size')
+        if raw is None:
+            return k
+        text = str(raw).strip().lower()
+        pool = round(float(text[:-1]) * k) if text.endswith('x') else int(text)
+        return max(k, pool)
+
+    def _environment(self) -> dict[str, str]:
         env = os.environ.copy()
         if self.params.get('local-dir'):
             env['DPEVAL_FI_LOCAL_BASE'] = os.path.expanduser(str(self.params['local-dir']))
-        logs = [' '.join(cmd)]
-        ctx.snapshot = lambda: self._read_plans(ctx, logs=None)
-
-        started = time.monotonic()
-        process = subprocess.Popen(cmd, cwd=ctx.workdir, env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
-        timed_out = False
-        try:
-            output, _ = process.communicate(timeout=None if budget is None else budget + margin / 2)
-            if process.returncode != 0:
-                logs.append(f'forbiditerative exited with code {process.returncode}')
-                logs += _tail(output)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            logs.append('forbiditerative overran its time limit and was killed')
-        finally:
-            # Also reached when the runner's own alarm fires mid-wait: never leave
-            # the planner running behind the harness's back.
-            _kill_group(process)
-
-        plans = self._read_plans(ctx, logs)[:ctx.k]
-        local = _local_folder(ctx)
-        if local:
-            ctx.snapshot = None
-            shutil.rmtree(local, ignore_errors=True)
-        elapsed = time.monotonic() - started
-        if budget is not None and elapsed >= budget - 1:
-            timed_out = True
-        if len(plans) >= ctx.k:
-            outcome = COMPLETE
-        elif timed_out:
-            outcome = TIMEOUT
-        else:
-            # FI stops by itself once no further plan fits the quality bound.
-            outcome = EXHAUSTED if plans else UNSOLVABLE
-        return DiverseRun(plans=plans, outcome=outcome, logs=logs,
-                          info={'fi-seconds': elapsed, 'fi-exit-code': process.returncode})
-
-    def _read_plans(self, ctx: PlanningContext, logs) -> List[Any]:
-        from unified_planning.io import PDDLReader
-
-        texts: List[str] = []
-        # A clean finish leaves the plans in found_plans/done; a timeout leaves
-        # them as sas_plan.N in FI's local folder. Take the first that has any.
-        local = _local_folder(ctx) or os.path.join(ctx.workdir, 'no-local-folder')
-        for directory in (os.path.join(ctx.workdir, 'found_plans', 'done'),
-                          os.path.join(ctx.workdir, 'found_plans'),
-                          os.path.join(local, 'found_plans', 'done'),
-                          os.path.join(local, 'found_plans'),
-                          local):
-            if not os.path.isdir(directory):
-                continue
-            for name in sorted(os.listdir(directory), key=_plan_number):
-                path = os.path.join(directory, name)
-                if not os.path.isfile(path) or not name.startswith('sas_plan'):
-                    continue
-                with open(path) as handle:
-                    text = '\n'.join(line for line in handle.read().splitlines()
-                                     if line.strip() and not line.lstrip().startswith(';'))
-                if text and text not in texts:
-                    texts.append(text)
-            if texts:
-                break
-        reader = PDDLReader()
-        plans = []
-        for text in texts:
-            try:
-                plans.append(reader.parse_plan_string(ctx.problem, text))
-            except Exception as error:                         # noqa: BLE001
-                if logs is not None:
-                    logs.append(f'could not parse an FI plan: {type(error).__name__}: {error}')
-        return plans
+        return env
 
 
-def _local_folder(ctx: PlanningContext):
+def _run(cmd: list[str], env: dict[str, str], cwd: str, budget: float | None, margin: float,
+         logs: list[str]) -> tuple[int | None, bool]:
+    """Run FI to completion or until the budget (plus half the margin) is spent.
+    Returns its exit code and whether it had to be killed."""
+    process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    timed_out = False
     try:
-        with open(os.path.join(ctx.workdir, 'fi-local.path')) as handle:
+        output, _ = process.communicate(timeout=None if budget is None else budget + margin / 2)
+        if process.returncode != 0:
+            logs.append(f'forbiditerative exited with code {process.returncode}')
+            logs += _tail(output)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        logs.append('forbiditerative overran its time limit and was killed')
+    finally:
+        # Also reached when the runner's own alarm fires mid-wait: never leave
+        # the planner running behind the harness's back.
+        _kill_group(process)
+    return process.returncode, timed_out
+
+
+def _read_plans(ctx: PlanningContext, logs: list[str] | None) -> list[Any]:
+    """FI's plan files parsed as UP plans; parse failures are logged when `logs` is given."""
+    from unified_planning.io import PDDLReader
+
+    reader = PDDLReader()
+    plans = []
+    for text in _plan_texts(ctx):
+        try:
+            plans.append(reader.parse_plan_string(ctx.problem, text))
+        except Exception as error:
+            if logs is not None:
+                logs.append(f'could not parse an FI plan: {type(error).__name__}: {error}')
+    return plans
+
+
+def _plan_texts(ctx: PlanningContext) -> list[str]:
+    """A clean finish leaves the plans in found_plans/done; a timeout leaves
+    them as sas_plan.N in FI's local folder. Take the first place that has any."""
+    local = _local_folder(ctx) or os.path.join(ctx.workdir, 'no-local-folder')
+    for directory in (os.path.join(ctx.workdir, 'found_plans', 'done'),
+                      os.path.join(ctx.workdir, 'found_plans'),
+                      os.path.join(local, 'found_plans', 'done'),
+                      os.path.join(local, 'found_plans'),
+                      local):
+        texts = _sas_plans_in(directory)
+        if texts:
+            return texts
+    return []
+
+
+def _sas_plans_in(directory: str) -> list[str]:
+    """The distinct ``sas_plan*`` files of `directory`, comments stripped, in plan order."""
+    if not os.path.isdir(directory):
+        return []
+    texts: list[str] = []
+    for name in sorted(os.listdir(directory), key=_plan_number):
+        path = os.path.join(directory, name)
+        if not name.startswith('sas_plan') or not os.path.isfile(path):
+            continue
+        with open(path) as handle:
+            text = '\n'.join(line for line in handle.read().splitlines()
+                             if line.strip() and not line.lstrip().startswith(';'))
+        if text and text not in texts:
+            texts.append(text)
+    return texts
+
+
+def _local_folder(ctx: PlanningContext) -> str | None:
+    try:
+        with open(os.path.join(ctx.workdir, _LOCAL_PATH_FILE)) as handle:
             return handle.read().strip() or None
     except OSError:
         return None
 
 
-def _plan_number(name: str):
+def _discard_local_folder(ctx: PlanningContext) -> None:
+    local = _local_folder(ctx)
+    if local:
+        ctx.snapshot = None
+        shutil.rmtree(local, ignore_errors=True)
+
+
+def _plan_number(name: str) -> tuple[int, str]:
     digits = ''.join(c for c in name if c.isdigit())
     return (int(digits) if digits else -1, name)
 
@@ -170,15 +228,13 @@ def _kill_group(process: subprocess.Popen) -> None:
         return
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    except OSError:
         process.kill()
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
 
 
-def _tail(output, lines: int = 20) -> List[str]:
+def _tail(output, lines: int = 20) -> list[str]:
     if not output:
         return []
     text = output.decode(errors='replace') if isinstance(output, bytes) else str(output)

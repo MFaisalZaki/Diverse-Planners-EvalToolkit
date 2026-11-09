@@ -26,80 +26,109 @@ import json
 import math
 import os
 import sys
-from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Sequence
+from typing import Any
 
-SOLVED, EXHAUSTED, TIMEOUT, MEMOUT = 'SOLVED', 'EXHAUSTED', 'TIMEOUT', 'MEMOUT'
-UNSOLVABLE, UNSUPPORTED, ERROR, KILLED, MISSING = 'UNSOLVABLE', 'UNSUPPORTED', 'ERROR', 'KILLED', 'MISSING'
-STATUS_ORDER = [SOLVED, EXHAUSTED, TIMEOUT, MEMOUT, UNSOLVABLE, UNSUPPORTED, ERROR, KILLED, MISSING]
+from .status import ERROR, EXHAUSTED, KILLED, MEMOUT, MISSING, SOLVED, TIMEOUT, UNSOLVABLE, UNSUPPORTED
 
 ROW_COLUMNS = [
     'planner', 'model', 'k', 'q', 'task_id', 'suite', 'domain', 'instance', 'track', 'ipc',
     'status', 'solved', 'planning_seconds', 'total_seconds', 'peak_memory_mb',
     'plan_count', 'valid_plans', 'invalid_plans', 'distinct_plans',
-    'b_coverage', 'b_maxsum', 'b_maxsum_normalised', 'stability', 'uniqueness',
+    'b_coverage', 'b_maxsum', 'b_maxsum_normalised', 'b_maxmin', 'b_novelty', 'stability', 'uniqueness',
     'min_cost', 'max_cost', 'mean_cost', 'native_b_coverage', 'optimal_length', 'eval_errors',
 ]
 
-Group = Tuple[str, int, float]
+# Diversity indicators averaged over the commonly solved instances.
+METRICS = ['b_coverage', 'b_maxsum', 'b_maxsum_normalised', 'b_maxmin', 'b_novelty',
+           'stability', 'uniqueness', 'distinct_plans', 'plan_count', 'mean_cost']
+# ... and the ones that also get a median and a sum.
+DETAILED_METRICS = ('b_coverage', 'b_maxsum')
+
+VIOLATION_COLUMNS = ['planner', 'model', 'k', 'q', 'task_id', 'max-cost', 'reference', 'bound']
+
+Group = tuple[str, int, float]
+Row = dict[str, Any]
 
 
 # ----------------------------------------------------------------------
 # Loading
 # ----------------------------------------------------------------------
 
-def load_rows(sandbox: str, results_dir: Optional[str] = None, strict_k: bool = False) -> List[Dict[str, Any]]:
+def load_rows(sandbox: str, results_dir: str | None = None, strict_k: bool = False) -> list[Row]:
     """One row per expected diversity task (plus any result not in tasks.json)."""
     sandbox = os.path.abspath(os.path.expanduser(sandbox))
-    results_dir = results_dir or os.path.join(sandbox, 'results')
-    rows: Dict[Tuple, Dict[str, Any]] = {}
-    markers: List[Dict[str, Any]] = []
-    for root, _dirs, files in os.walk(results_dir):
-        for name in files:
-            path = os.path.join(root, name)
-            try:
-                with open(path) as handle:
-                    payload = json.load(handle)
-            except (OSError, ValueError):
-                continue
-            if name.endswith('.json'):
-                row = _row(payload)
-                rows[_key(row)] = row
-            elif name.endswith('.running'):
-                markers.append(payload)
+    results, markers = _read_payloads(results_dir or os.path.join(sandbox, 'results'))
 
+    rows: dict[tuple, Row] = {}
+    for payload in results:
+        row = _row(payload)
+        rows[_key(row)] = row
+    # A marker without a result: the job was killed before it could report.
     for marker in markers:
         row = _row({**marker, 'status': KILLED})
         rows.setdefault(_key(row), row)
+    for entry in _expected_tasks(sandbox):
+        row = _expected_row(entry)
+        rows.setdefault(_key(row), row)
 
-    tasks_file = os.path.join(sandbox, 'tasks.json')
-    if os.path.exists(tasks_file):
-        with open(tasks_file) as handle:
-            expected = json.load(handle).get('expected', [])
-        for entry in expected:
-            row = {c: None for c in ROW_COLUMNS}
-            row.update({'planner': entry['planner'], 'model': entry['model'], 'k': int(entry['k']),
-                        'q': float(entry['q']), 'task_id': entry['task_id'], 'suite': entry.get('suite'),
-                        'domain': entry.get('domain'), 'instance': entry.get('instance'),
-                        'track': entry.get('track'), 'ipc': entry.get('ipc'), 'status': MISSING})
-            rows.setdefault(_key(row), row)
-
-    out = list(rows.values())
-    for row in out:
+    for row in rows.values():
         row['solved'] = is_solved(row, strict_k)
-    return sorted(out, key=lambda r: (r['model'], r['k'], r['q'], r['planner'], r['task_id']))
+    return sorted(rows.values(), key=lambda r: (r['model'], r['k'], r['q'], r['planner'], r['task_id']))
 
 
-def is_solved(row: Dict[str, Any], strict_k: bool = False) -> bool:
-    ok = (SOLVED,) if strict_k else (SOLVED, EXHAUSTED)
-    return row.get('status') in ok and (row.get('plan_count') or 0) > 0 and not (row.get('invalid_plans') or 0)
+def _read_payloads(results_dir: str) -> tuple[list[dict], list[dict]]:
+    """Every readable ``.json`` result and ``.running`` marker under `results_dir`."""
+    results: list[dict] = []
+    markers: list[dict] = []
+    for root, _dirs, files in os.walk(results_dir):
+        for name in files:
+            if name.endswith('.json'):
+                target = results
+            elif name.endswith('.running'):
+                target = markers
+            else:
+                continue
+            try:
+                with open(os.path.join(root, name)) as handle:
+                    target.append(json.load(handle))
+            except (OSError, ValueError):
+                continue
+    return results, markers
 
 
-def _key(row: Dict[str, Any]) -> Tuple:
+def _expected_tasks(sandbox: str) -> list[dict]:
+    tasks_file = os.path.join(sandbox, 'tasks.json')
+    if not os.path.exists(tasks_file):
+        return []
+    with open(tasks_file) as handle:
+        return json.load(handle).get('expected', [])
+
+
+def _expected_row(entry: dict) -> Row:
+    """The row of a task ``generate`` asked for but no result file reports."""
+    row = dict.fromkeys(ROW_COLUMNS)
+    row.update({'planner': entry['planner'], 'model': entry['model'], 'k': int(entry['k']),
+                'q': float(entry['q']), 'task_id': entry['task_id'], 'status': MISSING})
+    for column in ('suite', 'domain', 'instance', 'track', 'ipc'):
+        row[column] = entry.get(column)
+    return row
+
+
+def is_solved(row: Row, strict_k: bool = False) -> bool:
+    complete = (SOLVED,) if strict_k else (SOLVED, EXHAUSTED)
+    has_plans = (row.get('plan_count') or 0) > 0
+    all_valid = not (row.get('invalid_plans') or 0)
+    return row.get('status') in complete and has_plans and all_valid
+
+
+def _key(row: Row) -> tuple:
     return (row['planner'], row['model'], int(row['k']), float(row['q']), row['task_id'])
 
 
-def _row(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _row(payload: dict[str, Any]) -> Row:
+    """Flatten one result file into a table row."""
     task = payload.get('task') or {}
     div = payload.get('diversity') or {}
     timings = payload.get('timings') or {}
@@ -107,7 +136,6 @@ def _row(payload: Dict[str, Any]) -> Dict[str, Any]:
     scores = payload.get('diversity-scores') or {}
     info = payload.get('info') or {}
     costs = scores.get('costs') or metrics.get('plan-lengths') or []
-    plans = payload.get('plans') or []
     return {
         'planner': (payload.get('planner') or {}).get('tag'),
         'model': div.get('model'), 'k': int(div.get('k') or 0), 'q': float(div.get('q') or 1.0),
@@ -117,18 +145,20 @@ def _row(payload: Dict[str, Any]) -> Dict[str, Any]:
         'planning_seconds': timings.get('planning-seconds'),
         'total_seconds': timings.get('total-seconds'),
         'peak_memory_mb': metrics.get('peak-memory-mb'),
-        'plan_count': metrics.get('plan-count', len(plans)),
+        'plan_count': metrics.get('plan-count', len(payload.get('plans') or [])),
         'valid_plans': metrics.get('valid-plans'),
         'invalid_plans': metrics.get('invalid-plans'),
         'distinct_plans': scores.get('distinct-plans'),
         'b_coverage': scores.get('b-coverage'),
         'b_maxsum': scores.get('b-maxsum'),
         'b_maxsum_normalised': scores.get('b-maxsum-normalised'),
+        'b_maxmin': scores.get('b-maxmin'),
+        'b_novelty': scores.get('b-novelty'),
         'stability': scores.get('stability'),
         'uniqueness': scores.get('uniqueness'),
         'min_cost': min(costs) if costs else None,
         'max_cost': max(costs) if costs else None,
-        'mean_cost': (sum(costs) / len(costs)) if costs else None,
+        'mean_cost': _mean(costs),
         'native_b_coverage': info.get('native-b-coverage'),
         'optimal_length': info.get('optimal-length'),
         'eval_errors': len(scores.get('errors') or []),
@@ -139,99 +169,76 @@ def _row(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Aggregation
 # ----------------------------------------------------------------------
 
-def groups(rows: Sequence[Dict[str, Any]]) -> List[Group]:
+def groups(rows: Sequence[Row]) -> list[Group]:
     return sorted({(r['model'], r['k'], r['q']) for r in rows})
 
 
-def planners_of(rows: Sequence[Dict[str, Any]]) -> List[str]:
+def planners_of(rows: Sequence[Row]) -> list[str]:
     return sorted({r['planner'] for r in rows})
 
 
-def in_group(rows, group: Group) -> List[Dict[str, Any]]:
+def in_group(rows, group: Group) -> list[Row]:
     model, k, q = group
     return [r for r in rows if r['model'] == model and r['k'] == k and r['q'] == q]
 
 
-def coverage_table(rows: Sequence[Dict[str, Any]], by_track: bool = False) -> List[Dict[str, Any]]:
-    """Outcomes per (group, planner[, track]) over every attempted instance."""
-    buckets: Dict[Tuple, List[Dict[str, Any]]] = defaultdict(list)
+def _bucket(rows: Sequence[Row], *columns: str) -> list[tuple[tuple, list[Row]]]:
+    """Rows grouped by the given columns, in sorted key order."""
+    buckets: dict[tuple, list[Row]] = defaultdict(list)
     for row in rows:
-        key = (row['model'], row['k'], row['q'], row['planner']) + ((row['track'],) if by_track else ())
-        buckets[key].append(row)
-    table = []
-    for key, members in sorted(buckets.items()):
-        status = defaultdict(int)
-        for row in members:
-            status[row['status']] += 1
-        solved = sum(1 for r in members if r['solved'])
-        timeouts = [r for r in members if r['status'] == TIMEOUT]
-        partial = [r for r in timeouts if (r['plan_count'] or 0) > 0]
-        times = [r['planning_seconds'] for r in members if r['solved'] and r['planning_seconds'] is not None]
-        entry = {'model': key[0], 'k': key[1], 'q': key[2], 'planner': key[3]}
-        if by_track:
-            entry['track'] = key[4]
-        entry.update({
-            'attempted': len(members), 'solved': solved,
-            'coverage': solved / len(members) if members else 0.0,
-            'complete-k': status[SOLVED], 'exhausted': status[EXHAUSTED],
-            'timeouts': status[TIMEOUT], 'timeouts-with-plans': len(partial),
-            'mean-plans-at-timeout': _mean([r['plan_count'] or 0 for r in timeouts]),
-            'memouts': status[MEMOUT], 'unsolvable': status[UNSOLVABLE],
-            'unsupported': status[UNSUPPORTED], 'errors': status[ERROR],
-            'killed': status[KILLED], 'missing': status[MISSING],
-            'invalid-plan-sets': sum(1 for r in members if (r['invalid_plans'] or 0) > 0),
-            'mean-time-solved': _mean(times), 'median-time-solved': _median(times),
-        })
-        table.append(entry)
-    return table
+        buckets[tuple(row[c] for c in columns)].append(row)
+    return sorted(buckets.items())
 
 
-def common_solved(rows: Sequence[Dict[str, Any]], group: Group) -> List[str]:
+def coverage_table(rows: Sequence[Row], by_track: bool = False) -> list[Row]:
+    """Outcomes per (group, planner[, track]) over every attempted instance."""
+    columns = ('model', 'k', 'q', 'planner') + (('track',) if by_track else ())
+    return [{**dict(zip(columns, key)), **_outcome_summary(members)}
+            for key, members in _bucket(rows, *columns)]
+
+
+def _outcome_summary(members: Sequence[Row]) -> Row:
+    status = Counter(r['status'] for r in members)
+    solved = sum(1 for r in members if r['solved'])
+    timeouts = [r for r in members if r['status'] == TIMEOUT]
+    times = [r['planning_seconds'] for r in members if r['solved'] and r['planning_seconds'] is not None]
+    return {
+        'attempted': len(members), 'solved': solved,
+        'coverage': solved / len(members) if members else 0.0,
+        'complete-k': status[SOLVED], 'exhausted': status[EXHAUSTED],
+        'timeouts': status[TIMEOUT],
+        'timeouts-with-plans': sum(1 for r in timeouts if (r['plan_count'] or 0) > 0),
+        'mean-plans-at-timeout': _mean([r['plan_count'] or 0 for r in timeouts]),
+        'memouts': status[MEMOUT], 'unsolvable': status[UNSOLVABLE],
+        'unsupported': status[UNSUPPORTED], 'errors': status[ERROR],
+        'killed': status[KILLED], 'missing': status[MISSING],
+        'invalid-plan-sets': sum(1 for r in members if (r['invalid_plans'] or 0) > 0),
+        'mean-time-solved': _mean(times), 'median-time-solved': _median(times),
+    }
+
+
+def common_solved(rows: Sequence[Row], group: Group) -> list[str]:
     """Task ids solved by every planner that took part in the group."""
     members = in_group(rows, group)
     planners = planners_of(members)
-    solved_by = {p: {r['task_id'] for r in members if r['planner'] == p and r['solved']} for p in planners}
     if not planners:
         return []
-    return sorted(set.intersection(*solved_by.values()))
+    solved_by = [{r['task_id'] for r in members if r['planner'] == p and r['solved']} for p in planners]
+    return sorted(set.intersection(*solved_by))
 
 
-METRICS = ['b_coverage', 'b_maxsum', 'b_maxsum_normalised', 'stability', 'uniqueness',
-           'distinct_plans', 'plan_count', 'mean_cost']
-
-
-def diversity_table(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def diversity_table(rows: Sequence[Row]) -> list[Row]:
     """Diversity indicators per (group, planner) over the commonly solved instances."""
     table = []
     for group in groups(rows):
         members = in_group(rows, group)
         common = set(common_solved(rows, group))
-        planners = planners_of(members)
-        by_task: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
-        for r in members:
-            if r['task_id'] in common:
-                by_task[r['task_id']][r['planner']] = r
-        wins = defaultdict(int)
-        ties = defaultdict(int)
-        for per_planner in by_task.values():
-            values = {p: (r['b_coverage'] or 0) for p, r in per_planner.items()}
-            best = max(values.values()) if values else None
-            leaders = [p for p, v in values.items() if v == best]
-            for p in leaders:
-                if len(leaders) == 1:
-                    wins[p] += 1
-                else:
-                    ties[p] += 1
-        for planner in planners:
+        by_task = _rows_by_task(members, common)
+        wins, ties = _bcoverage_leaders(by_task)
+        for planner in planners_of(members):
             selected = [by_task[t][planner] for t in sorted(by_task) if planner in by_task[t]]
             entry = {'model': group[0], 'k': group[1], 'q': group[2], 'planner': planner,
-                     'common-solved': len(common)}
-            for metric in METRICS:
-                values = [r[metric] for r in selected if r[metric] is not None]
-                entry[f'mean-{metric}'] = _mean(values)
-                if metric in ('b_coverage', 'b_maxsum'):
-                    entry[f'median-{metric}'] = _median(values)
-                    entry[f'sum-{metric}'] = sum(values) if values else None
+                     'common-solved': len(common), **_metric_summary(selected)}
             entry['b-coverage-ratio'] = _mean([(r['b_coverage'] or 0) / group[1] for r in selected])
             entry['best-b-coverage'] = wins[planner]
             entry['tied-b-coverage'] = ties[planner]
@@ -239,20 +246,51 @@ def diversity_table(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return table
 
 
-def per_domain_table(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    buckets: Dict[Tuple, List[Dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        buckets[(row['model'], row['k'], row['q'], row['track'], row['domain'], row['planner'])].append(row)
-    return [{'model': key[0], 'k': key[1], 'q': key[2], 'track': key[3], 'domain': key[4],
-             'planner': key[5], 'attempted': len(members),
+def _rows_by_task(members: Sequence[Row], common: set[str]) -> dict[str, dict[str, Row]]:
+    """``task_id -> planner -> row`` over the commonly solved tasks."""
+    by_task: dict[str, dict[str, Row]] = defaultdict(dict)
+    for r in members:
+        if r['task_id'] in common:
+            by_task[r['task_id']][r['planner']] = r
+    return by_task
+
+
+def _bcoverage_leaders(by_task: dict[str, dict[str, Row]]) -> tuple[Counter, Counter]:
+    """Per planner: on how many tasks it alone had the best B-Coverage (wins),
+    and on how many it shared the best value (ties)."""
+    wins: Counter = Counter()
+    ties: Counter = Counter()
+    for per_planner in by_task.values():
+        values = {p: (r['b_coverage'] or 0) for p, r in per_planner.items()}
+        best = max(values.values())
+        leaders = [p for p, v in values.items() if v == best]
+        (wins if len(leaders) == 1 else ties).update(leaders)
+    return wins, ties
+
+
+def _metric_summary(selected: Sequence[Row]) -> Row:
+    summary: Row = {}
+    for metric in METRICS:
+        values = [r[metric] for r in selected if r[metric] is not None]
+        summary[f'mean-{metric}'] = _mean(values)
+        if metric in DETAILED_METRICS:
+            summary[f'median-{metric}'] = _median(values)
+            summary[f'sum-{metric}'] = sum(values) if values else None
+    return summary
+
+
+def per_domain_table(rows: Sequence[Row]) -> list[Row]:
+    columns = ('model', 'k', 'q', 'track', 'domain', 'planner')
+    return [{**dict(zip(columns, key)),
+             'attempted': len(members),
              'solved': sum(1 for r in members if r['solved']),
              'timeouts': sum(1 for r in members if r['status'] == TIMEOUT),
              'mean-b-coverage-solved': _mean([r['b_coverage'] for r in members
                                               if r['solved'] and r['b_coverage'] is not None])}
-            for key, members in sorted(buckets.items())]
+            for key, members in _bucket(rows, *columns)]
 
 
-def quality_bound_check(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def quality_bound_check(rows: Sequence[Row]) -> list[Row]:
     """Plan sets whose costliest plan exceeds q x the best known shortest plan.
 
     The best known shortest plan of an instance is the cheapest plan any
@@ -261,33 +299,35 @@ def quality_bound_check(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     outside the quality bound it was asked for (or the reference is not
     optimal, which the ``reference`` column lets you judge).
     """
-    best: Dict[str, float] = {}
+    best: dict[str, float] = {}
     for r in rows:
         for value in (r.get('min_cost'), r.get('optimal_length')):
             if value:
                 best[r['task_id']] = min(best.get(r['task_id'], math.inf), float(value))
-    out = []
+    violations = []
     for r in rows:
         if not r['solved'] or r['max_cost'] is None or r['task_id'] not in best:
             continue
         bound = math.floor(r['q'] * best[r['task_id']] + 1e-9)
         if r['max_cost'] > bound:
-            out.append({'planner': r['planner'], 'model': r['model'], 'k': r['k'], 'q': r['q'],
-                        'task_id': r['task_id'], 'max-cost': r['max_cost'],
-                        'reference': best[r['task_id']], 'bound': bound})
-    return out
+            violations.append({'planner': r['planner'], 'model': r['model'], 'k': r['k'], 'q': r['q'],
+                               'task_id': r['task_id'], 'max-cost': r['max_cost'],
+                               'reference': best[r['task_id']], 'bound': bound})
+    return violations
 
 
-def native_agreement(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def native_agreement(rows: Sequence[Row]) -> list[Row]:
     """Where a planner reports its own B-Coverage: how often it matches ours."""
-    buckets = defaultdict(lambda: [0, 0])
+    compared: Counter = Counter()
+    agree: Counter = Counter()
     for r in rows:
         if r['native_b_coverage'] is None or r['b_coverage'] is None:
             continue
-        bucket = buckets[(r['planner'], r['model'])]
-        bucket[0] += 1
-        bucket[1] += int(r['native_b_coverage'] == r['b_coverage'])
-    return [{'planner': p, 'model': m, 'compared': n, 'agree': a} for (p, m), (n, a) in sorted(buckets.items())]
+        key = (r['planner'], r['model'])
+        compared[key] += 1
+        agree[key] += int(r['native_b_coverage'] == r['b_coverage'])
+    return [{'planner': p, 'model': m, 'compared': compared[(p, m)], 'agree': agree[(p, m)]}
+            for p, m in sorted(compared)]
 
 
 # ----------------------------------------------------------------------
@@ -295,7 +335,8 @@ def native_agreement(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------------------
 
 def analyze(args) -> int:
-    rows = load_rows(args.sandbox_dir, args.results_dir, strict_k=getattr(args, 'strict_k', False))
+    strict_k = bool(getattr(args, 'strict_k', False))
+    rows = load_rows(args.sandbox_dir, args.results_dir, strict_k=strict_k)
     if not rows:
         print(f'No results under {args.sandbox_dir}.', file=sys.stderr)
         return 1
@@ -314,13 +355,12 @@ def analyze(args) -> int:
     write_csv(os.path.join(out_dir, 'coverage-per-track.csv'), coverage_track)
     write_csv(os.path.join(out_dir, 'diversity-common-solved.csv'), diversity)
     write_csv(os.path.join(out_dir, 'per-domain.csv'), per_domain)
-    write_csv(os.path.join(out_dir, 'quality-bound-violations.csv'), violations,
-              ['planner', 'model', 'k', 'q', 'task_id', 'max-cost', 'reference', 'bound'])
+    write_csv(os.path.join(out_dir, 'quality-bound-violations.csv'), violations, VIOLATION_COLUMNS)
     common = {f'{m}|k={k}|q={q}': common_solved(rows, (m, k, q)) for m, k, q in groups(rows)}
     with open(os.path.join(out_dir, 'summary.json'), 'w') as handle:
         json.dump({'coverage': coverage, 'coverage-per-track': coverage_track, 'diversity': diversity,
                    'common-solved': common, 'quality-bound-violations': violations,
-                   'native-agreement': agreement, 'strict-k': bool(getattr(args, 'strict_k', False))},
+                   'native-agreement': agreement, 'strict-k': strict_k},
                   handle, indent=1, default=str)
     text = render_summary(rows, coverage, diversity, violations, agreement,
                           per_domain if getattr(args, 'per_domain', False) else None)
@@ -328,45 +368,18 @@ def analyze(args) -> int:
         handle.write(text)
     print(text)
     print(f'\nWritten to {out_dir}')
-    _list_errors(args.sandbox_dir, rows)
+    _list_errors(args.sandbox_dir)
     return 0
 
 
 def render_summary(rows, coverage, diversity, violations, agreement, per_domain=None) -> str:
-    lines: List[str] = []
+    lines: list[str] = []
     for group in groups(rows):
-        model, k, q = group
-        lines.append('=' * 100)
-        lines.append(f'model={model}  k={k}  q={q}')
-        lines.append('=' * 100)
-        lines.append(f'{"planner":<22}{"solved":>15}{"complete":>10}{"exhaust":>9}{"timeout":>9}'
-                     f'{"(w/plans)":>10}{"memout":>8}{"error":>7}{"unsup":>7}{"missing":>8}')
-        for c in coverage:
-            if (c['model'], c['k'], c['q']) != group:
-                continue
-            lines.append(f'{c["planner"]:<22}{c["solved"]:>5}/{c["attempted"]:<4}{100 * c["coverage"]:>4.0f}%'
-                         f'{c["complete-k"]:>10}{c["exhausted"]:>9}{c["timeouts"]:>9}'
-                         f'{c["timeouts-with-plans"]:>10}{c["memouts"]:>8}{c["errors"]:>7}'
-                         f'{c["unsupported"]:>7}{c["missing"]:>8}')
-        group_div = [d for d in diversity if (d['model'], d['k'], d['q']) == group]
-        if group_div:
-            lines.append('')
-            lines.append(f'diversity over the {group_div[0]["common-solved"]} commonly solved instances:')
-            lines.append(f'{"planner":<22}{"B-Cov":>8}{"B-Cov/k":>9}{"B-MaxSum":>10}{"B-MS/pair":>10}'
-                         f'{"stab.":>7}{"uniq.":>7}{"#plans":>8}{"best":>6}{"tied":>6}')
-            for d in group_div:
-                lines.append(f'{d["planner"]:<22}{_fmt(d["mean-b_coverage"]):>8}{_fmt(d["b-coverage-ratio"]):>9}'
-                             f'{_fmt(d["mean-b_maxsum"]):>10}{_fmt(d["mean-b_maxsum_normalised"]):>10}'
-                             f'{_fmt(d["mean-stability"]):>7}{_fmt(d["mean-uniqueness"]):>7}'
-                             f'{_fmt(d["mean-plan_count"]):>8}{d["best-b-coverage"]:>6}{d["tied-b-coverage"]:>6}')
+        lines += _coverage_section(group, coverage)
+        lines += _diversity_section([d for d in diversity if (d['model'], d['k'], d['q']) == group])
         lines.append('')
     if per_domain:
-        lines.append('per-domain coverage')
-        lines.append(f'{"model":<12}{"k":>4}{"q":>6}  {"domain":<34}{"planner":<22}{"solved":>10}{"TO":>5}')
-        for d in per_domain:
-            lines.append(f'{d["model"][:11]:<12}{d["k"]:>4}{d["q"]:>6}  {str(d["domain"])[:33]:<34}'
-                         f'{d["planner"][:21]:<22}{d["solved"]:>4}/{d["attempted"]:<5}{d["timeouts"]:>5}')
-        lines.append('')
+        lines += _per_domain_section(per_domain)
     if violations:
         lines.append(f'{len(violations)} solved plan set(s) exceed q x best-known shortest plan '
                      f'(see quality-bound-violations.csv)')
@@ -376,7 +389,45 @@ def render_summary(rows, coverage, diversity, violations, agreement, per_domain=
     return '\n'.join(lines) + '\n'
 
 
-def _list_errors(sandbox: str, rows) -> None:
+def _coverage_section(group: Group, coverage: Sequence[Row]) -> list[str]:
+    model, k, q = group
+    lines = ['=' * 100, f'model={model}  k={k}  q={q}', '=' * 100,
+             f'{"planner":<22}{"solved":>15}{"complete":>10}{"exhaust":>9}{"timeout":>9}'
+             f'{"(w/plans)":>10}{"memout":>8}{"error":>7}{"unsup":>7}{"missing":>8}']
+    for c in coverage:
+        if (c['model'], c['k'], c['q']) == group:
+            lines.append(f'{c["planner"]:<22}{c["solved"]:>5}/{c["attempted"]:<4}{100 * c["coverage"]:>4.0f}%'
+                         f'{c["complete-k"]:>10}{c["exhausted"]:>9}{c["timeouts"]:>9}'
+                         f'{c["timeouts-with-plans"]:>10}{c["memouts"]:>8}{c["errors"]:>7}'
+                         f'{c["unsupported"]:>7}{c["missing"]:>8}')
+    return lines
+
+
+def _diversity_section(group_div: Sequence[Row]) -> list[str]:
+    if not group_div:
+        return []
+    lines = ['', f'diversity over the {group_div[0]["common-solved"]} commonly solved instances:',
+             f'{"planner":<22}{"B-Cov":>8}{"B-Cov/k":>9}{"B-MaxSum":>10}{"B-MS/pair":>10}'
+             f'{"stab.":>7}{"uniq.":>7}{"#plans":>8}{"best":>6}{"tied":>6}']
+    for d in group_div:
+        lines.append(f'{d["planner"]:<22}{_fmt(d["mean-b_coverage"]):>8}{_fmt(d["b-coverage-ratio"]):>9}'
+                     f'{_fmt(d["mean-b_maxsum"]):>10}{_fmt(d["mean-b_maxsum_normalised"]):>10}'
+                     f'{_fmt(d["mean-stability"]):>7}{_fmt(d["mean-uniqueness"]):>7}'
+                     f'{_fmt(d["mean-plan_count"]):>8}{d["best-b-coverage"]:>6}{d["tied-b-coverage"]:>6}')
+    return lines
+
+
+def _per_domain_section(per_domain: Sequence[Row]) -> list[str]:
+    lines = ['per-domain coverage',
+             f'{"model":<12}{"k":>4}{"q":>6}  {"domain":<34}{"planner":<22}{"solved":>10}{"TO":>5}']
+    for d in per_domain:
+        lines.append(f'{d["model"][:11]:<12}{d["k"]:>4}{d["q"]:>6}  {str(d["domain"])[:33]:<34}'
+                     f'{d["planner"][:21]:<22}{d["solved"]:>4}/{d["attempted"]:<5}{d["timeouts"]:>5}')
+    lines.append('')
+    return lines
+
+
+def _list_errors(sandbox: str) -> None:
     errors_dir = os.path.join(os.path.abspath(sandbox), 'errors')
     if os.path.isdir(errors_dir):
         logs = sorted(os.listdir(errors_dir))
@@ -384,7 +435,7 @@ def _list_errors(sandbox: str, rows) -> None:
             print(f'{len(logs)} traceback(s) in {errors_dir}')
 
 
-def write_csv(path: str, rows: Iterable[Dict[str, Any]], columns: Optional[Sequence[str]] = None) -> None:
+def write_csv(path: str, rows: Iterable[Row], columns: Sequence[str] | None = None) -> None:
     rows = list(rows)
     columns = list(columns or (rows[0].keys() if rows else []))
     with open(path, 'w', newline='') as handle:
@@ -400,12 +451,12 @@ def _csv(value):
     return value
 
 
-def _mean(values: Sequence[float]) -> Optional[float]:
+def _mean(values: Sequence[float]) -> float | None:
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
 
 
-def _median(values: Sequence[float]) -> Optional[float]:
+def _median(values: Sequence[float]) -> float | None:
     values = sorted(v for v in values if v is not None)
     if not values:
         return None

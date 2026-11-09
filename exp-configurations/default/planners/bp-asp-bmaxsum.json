@@ -1,0 +1,11 @@
+{
+    "planner-tag": "BP-ASP-BMaxSum",
+    "adapter": "bp-asp",
+    "planner-params": {
+        "indicator": "B-MaxSum",
+        "max-horizon": 1000
+    },
+    "tracks": [
+        "classical"
+    ]
+}

@@ -20,11 +20,13 @@ so this never changes what is measured -- only what the planner is told.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import Any
 
-from .base import COMPLETE, EXHAUSTED, TIMEOUT, UNSOLVABLE, DiversePlannerAdapter, DiverseRun, PlanningContext
+from .base import DiversePlannerAdapter, DiverseRun, PlanningContext
 
 _FORWARDED = ('horizon_length', 'horizon_planning_mode', 'use_pypmt')
+# Seconds before the deadline at which a run that is still going counts as timed out.
+_DEADLINE_SLACK = 6.0
 
 
 class BehaviourPlanningSMTAdapter(DiversePlannerAdapter):
@@ -35,19 +37,16 @@ class BehaviourPlanningSMTAdapter(DiversePlannerAdapter):
         reason = super().unsupported_reason(ctx)
         if reason:
             return reason
-        has_cb = any(k == 'cb' for k, _ in ctx.features)
-        if ctx.q != 1.0 and not has_cb and self.params.get('implicit-cost-bound') is False:
+        if ctx.q != 1.0 and not ctx.has_feature('cb') and self.params.get('implicit-cost-bound') is False:
             return 'q != 1.0 needs a cb dimension and implicit-cost-bound is false'
         return None
 
-    def dimensions(self, ctx: PlanningContext, logs: List[str]) -> List[List[Any]]:
-        dims: List[List[Any]] = []
-        for key, config in ctx.features:
-            if key == 'cb':
-                continue
-            dims.append([key, config if config not in (None, '') else {}])
+    def dimensions(self, ctx: PlanningContext, logs: list[str]) -> list[list[Any]]:
+        """The behaviour-space dimensions: the model's features, with ``cb``
+        carrying the quality bound when the model has one or the task needs one."""
+        dims = [[key, config or {}] for key, config in ctx.features if key != 'cb']
+        has_cb = ctx.has_feature('cb')
         implicit = self.params.get('implicit-cost-bound')
-        has_cb = any(k == 'cb' for k, _ in ctx.features)
         if has_cb or implicit is True or (implicit is None and ctx.q != 1.0):
             dims.append(['cb', {'quality-bound': ctx.q}])
             if not has_cb:
@@ -57,39 +56,35 @@ class BehaviourPlanningSMTAdapter(DiversePlannerAdapter):
     def plan(self, ctx: PlanningContext) -> DiverseRun:
         from behaviour_planning_smt.fbi.planner import ForbiddenBehaviorSMTPlanner
 
-        logs: List[str] = []
+        logs: list[str] = []
         dims = self.dimensions(ctx, logs)
-        kwargs: Dict[str, Any] = {k: self.params[k] for k in _FORWARDED if k in self.params}
+        kwargs = {k: self.params[k] for k in _FORWARDED if k in self.params}
 
         build_start = time.monotonic()
         planner = ForbiddenBehaviorSMTPlanner(ctx.problem, dims, **kwargs)
         space = planner.behaviour_space
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             'dimensions': [d[0] for d in dims],
             'optimal-length': getattr(space, 'optimal_plan_length', None),
             'build-seconds': time.monotonic() - build_start,
         }
         if self.params.get('solver-memory-mb'):
             planner.solver_memorylimit = int(self.params['solver-memory-mb'])
-        # Every z3 check gets what is left of the budget, not a fixed 300 s.
-        original_check = space.check
-
-        def check(assumptions=(), timeout=None, memorylimit=None):
-            remaining = ctx.remaining(margin=5.0)
-            budget = None if remaining is None else max(1000, int(remaining * 1000))
-            return original_check(list(assumptions), budget, memorylimit)
-
-        space.check = check
+        space.check = _budgeted_check(space.check, ctx)
         ctx.snapshot = lambda: list(planner.plan_set)
 
-        plans = list(planner.plan(ctx.k))
-        out_of_time = ctx.deadline is not None and time.monotonic() >= ctx.deadline - 6.0
-        if len(plans) >= ctx.k:
-            outcome = COMPLETE
-        elif out_of_time:
-            outcome = TIMEOUT
-        else:
-            outcome = EXHAUSTED if plans else UNSOLVABLE
+        plans = list(planner.plan(ctx.k))[:ctx.k]
+        out_of_time = ctx.deadline is not None and time.monotonic() >= ctx.deadline - _DEADLINE_SLACK
         logs += [str(line) for line in getattr(space, 'log', [])]
-        return DiverseRun(plans=plans[:ctx.k], outcome=outcome, logs=logs, info=info,
-                          native_behaviours=[getattr(p, 'behaviour_str', None) for p in plans[:ctx.k]])
+        return DiverseRun(plans=plans, outcome=self.outcome_for(len(plans), ctx.k, out_of_time), logs=logs,
+                          info=info, native_behaviours=[getattr(p, 'behaviour_str', None) for p in plans])
+
+
+def _budgeted_check(original_check, ctx: PlanningContext):
+    """Wrap the space's ``check`` so every z3 call gets what is left of the
+    task's budget, not a fixed 300 s."""
+    def check(assumptions=(), timeout=None, memorylimit=None):
+        remaining = ctx.remaining(margin=5.0)
+        budget_ms = None if remaining is None else max(1000, int(remaining * 1000))
+        return original_check(list(assumptions), budget_ms, memorylimit)
+    return check

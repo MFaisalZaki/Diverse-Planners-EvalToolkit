@@ -9,12 +9,12 @@ touching the toolkit.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Dict, Optional, Type
+from typing import Any
 
-from .base import (COMPLETE, ERROR, EXHAUSTED, MEMOUT, TIMEOUT, UNSOLVABLE, UNSUPPORTED,
-                   DiversePlannerAdapter, DiverseRun, PlanningContext)
+from .base import (COMPLETE, ERROR, EXHAUSTED, MEMOUT, TIMEOUT, UNSOLVABLE, UNSUPPORTED, DiversePlannerAdapter,
+                   DiverseRun, PlanningContext)
 
-BUILTIN_ADAPTERS: Dict[str, str] = {
+BUILTIN_ADAPTERS: dict[str, str] = {
     'fi': 'dp_eval_toolkit.adapters.fi:ForbidIterativeAdapter',
     'bp-smt': 'dp_eval_toolkit.adapters.bp_smt:BehaviourPlanningSMTAdapter',
     'bp-asp': 'dp_eval_toolkit.adapters.bp_asp:BehaviourPlanningASPAdapter',
@@ -22,15 +22,15 @@ BUILTIN_ADAPTERS: Dict[str, str] = {
 }
 
 
-def load_adapter(name: str, params: Optional[Dict[str, Any]] = None) -> DiversePlannerAdapter:
+def load_adapter(name: str, params: dict[str, Any] | None = None) -> DiversePlannerAdapter:
     spec = BUILTIN_ADAPTERS.get(name, name)
     if ':' not in spec:
         raise ValueError(f'unknown adapter {name!r}: use one of {sorted(BUILTIN_ADAPTERS)} '
                          f'or "package.module:ClassName"')
     module_name, class_name = spec.split(':', 1)
-    cls: Type[DiversePlannerAdapter] = getattr(importlib.import_module(module_name), class_name)
+    cls: type[DiversePlannerAdapter] = getattr(importlib.import_module(module_name), class_name)
     return cls(params)
 
 
-__all__ = ['BUILTIN_ADAPTERS', 'load_adapter', 'DiversePlannerAdapter', 'DiverseRun', 'PlanningContext',
-           'COMPLETE', 'EXHAUSTED', 'UNSOLVABLE', 'TIMEOUT', 'MEMOUT', 'UNSUPPORTED', 'ERROR']
+__all__ = ['BUILTIN_ADAPTERS', 'COMPLETE', 'ERROR', 'EXHAUSTED', 'MEMOUT', 'TIMEOUT', 'UNSOLVABLE', 'UNSUPPORTED',
+           'DiversePlannerAdapter', 'DiverseRun', 'PlanningContext', 'load_adapter']

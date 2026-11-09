@@ -1,0 +1,12 @@
+{
+    "planner-tag": "FI-BCoverage",
+    "adapter": "fi",
+    "planner-params": {
+        "planner": "extended_unordered_topq",
+        "symmetries": true,
+        "select": "B-Coverage"
+    },
+    "tracks": [
+        "classical"
+    ]
+}
